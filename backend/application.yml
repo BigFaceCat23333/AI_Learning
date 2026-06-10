@@ -2,7 +2,7 @@ ai_learning:
   app_name: ai-learning
   database_url: postgresql+psycopg://urpapa:postgres@localhost:5432/ai_learning
   llm_base_url: https://api.deepseek.com
-  llm_api_key: sk-b4e03fe347bf402785ab2246610d9102
+  llm_api_key: your_deepseek_api_key_here
   llm_model: deepseek-v4-flash
   upload_dir: uploads
   upload_max_bytes: 5242880
