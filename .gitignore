@@ -1,0 +1,26 @@
+# ===== 前端 (front) =====
+front/node_modules/
+front/dist/
+front/*.tsbuildinfo
+
+# ===== 后端 (backend) =====
+backend/.venv/
+__pycache__/
+backend/.pytest_cache/
+backend/uploads/
+backend/*.egg-info/
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 本地协作状态 =====
+.agents/
+.claude/
