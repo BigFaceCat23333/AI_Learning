@@ -1,0 +1,29 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      AI_LEARNING_DATABASE_URL: ${AI_LEARNING_DATABASE_URL:-postgresql+psycopg://urpapa:postgres@host.docker.internal:5432/ai_learning}
+      AI_LEARNING_LLM_BASE_URL: ${AI_LEARNING_LLM_BASE_URL:-https://api.deepseek.com}
+      AI_LEARNING_LLM_API_KEY: ${AI_LEARNING_LLM_API_KEY:-}
+      AI_LEARNING_LLM_MODEL: ${AI_LEARNING_LLM_MODEL:-deepseek-v4-flash}
+      AI_LEARNING_UPLOAD_DIR: /app/uploads
+      AI_LEARNING_UPLOAD_MAX_BYTES: ${AI_LEARNING_UPLOAD_MAX_BYTES:-5242880}
+      PYTHONPATH: /app/backend/src
+    volumes:
+      - backend_uploads:/app/uploads
+    ports:
+      - "8000:8000"
+
+  front:
+    build:
+      context: ./front
+      args:
+        VITE_API_BASE_URL: /api
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  backend_uploads:

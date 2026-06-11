@@ -116,6 +116,49 @@ cd backend
 uv run --extra dev python -m pytest
 ```
 
+## Docker 启动
+
+当前 Docker 方案只运行前端和后端，PostgreSQL 继续使用本机已安装的数据库。
+
+容器访问宿主机数据库时不能使用 `localhost`，需要使用 `host.docker.internal`：
+
+```bash
+cp .env.example .env
+```
+
+按需编辑 `.env`，至少确认数据库连接串和 LLM API Key：
+
+```env
+AI_LEARNING_DATABASE_URL=postgresql+psycopg://urpapa:postgres@host.docker.internal:5432/ai_learning
+AI_LEARNING_LLM_API_KEY=你的 API Key
+```
+
+启动 Docker 服务：
+
+```bash
+docker compose up --build
+```
+
+启动后访问：
+
+```text
+前端：http://localhost:3000
+后端：http://localhost:8000
+健康检查：http://localhost:8000/api/health
+```
+
+如果只想后台运行：
+
+```bash
+docker compose up --build -d
+```
+
+停止服务：
+
+```bash
+docker compose down
+```
+
 ## 使用流程
 
 1. 启动 PostgreSQL，并确认 `ai_learning` 数据库存在。
