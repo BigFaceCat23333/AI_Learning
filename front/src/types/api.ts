@@ -15,9 +15,12 @@ export interface QueryRequest {
 export interface QuerySource {
   document_id: number;
   filename: string;
+  file_type: string;
   chunk_id: number;
+  chunk_index: number;
   chunk_text: string;
   score: number;
+  chunk_metadata: Record<string, unknown>;
 }
 
 export interface QueryResponse {

@@ -14,7 +14,10 @@ export default function SourceList({ sources }: SourceListProps) {
         <div key={index} className="source-item">
           <div className="source-meta">
             <span className="source-filename">{source.filename}</span>
-            <span className="source-chunk">chunk #{source.chunk_id}</span>
+            <span className="source-type">{source.file_type}</span>
+            <span className="source-chunk">
+              chunk #{source.chunk_index}
+            </span>
             <span className="source-score">
               相关度: {(source.score * 100).toFixed(1)}%
             </span>

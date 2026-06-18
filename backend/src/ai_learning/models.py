@@ -1,8 +1,11 @@
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from ai_learning.core.config import get_settings
 from ai_learning.db import Base
 
 
@@ -29,6 +32,12 @@ class DocumentChunk(Base):
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"), nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(get_settings().embedding_dimensions), nullable=False
+    )
+    chunk_metadata: Mapped[dict] = mapped_column(JSONB, name="chunk_metadata", nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    char_count: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     document: Mapped[Document] = relationship(back_populates="chunks")

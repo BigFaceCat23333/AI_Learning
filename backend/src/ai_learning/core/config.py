@@ -18,6 +18,18 @@ class Settings(BaseSettings):
     upload_dir: str = "uploads"
     upload_max_bytes: int = 5 * 1024 * 1024
 
+    # embedding 相关配置
+    embedding_provider: str = "openai_compatible"
+    embedding_base_url: str = ""
+    embedding_api_key: Optional[str] = None
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
+
+    # 检索配置
+    retrieval_min_score: float = 0.35
+    retrieval_top_k: int = 5
+    retrieval_candidate_k: int = 20
+
     model_config = SettingsConfigDict(
         env_prefix="AI_LEARNING_",
         env_file=".env",

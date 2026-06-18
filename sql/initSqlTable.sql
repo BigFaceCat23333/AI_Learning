@@ -1,0 +1,40 @@
+-- ai-learning 数据库初始化 SQL
+-- 使用方式：psql -h localhost -p 5432 -U urpapa -d ai_learning -f sql/initSqlTable.sql
+-- 注意：本脚本会删除并重建 documents 和 document_chunks 表，仅适用于开发环境。
+
+-- 启用 pgvector 扩展
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 清理旧表（级联删除以处理外键依赖）
+DROP TABLE IF EXISTS document_chunks;
+DROP TABLE IF EXISTS documents;
+
+-- 文档表
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    filename VARCHAR(255) NOT NULL,
+    file_type VARCHAR(20) NOT NULL,
+    saved_path VARCHAR(500) NOT NULL,
+    raw_text TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- 文档分块表
+CREATE TABLE document_chunks (
+    id SERIAL PRIMARY KEY,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    embedding vector(1536) NOT NULL,
+    chunk_metadata JSONB NOT NULL,
+    content_hash VARCHAR(64) NOT NULL,
+    char_count INTEGER NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- 常规索引
+CREATE INDEX idx_document_chunks_document_id ON document_chunks(document_id);
+CREATE INDEX idx_document_chunks_content_hash ON document_chunks(content_hash);
+
+-- 向量索引（HNSW，用于 cosine distance 高效召回）
+CREATE INDEX idx_document_chunks_embedding ON document_chunks USING hnsw (embedding vector_cosine_ops);

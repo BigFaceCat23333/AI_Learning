@@ -1,5 +1,10 @@
 # Codex + Claude 双终端协作流程
 
+使用命令，需要codex输入：
+请分析这个需求，生成给 Claude 执行的实现计划。不要改代码。把计划写入 .agents/PLAN.md。
+计划要包含：目标、影响文件、实现步骤、测试建议、注意事项。
+最后把计划发给 Claude，并且等待 Claude 完成并自动触发审查。
+
 ## 目标
 
 左边运行 Codex CLI，右边运行 Claude CLI。

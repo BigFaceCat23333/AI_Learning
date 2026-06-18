@@ -1,7 +1,7 @@
 from collections.abc import Generator
 from functools import lru_cache
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from ai_learning.core.config import get_settings
@@ -23,9 +23,17 @@ def get_session_factory():
 
 
 def init_db() -> None:
+    """初始化数据库：启用 pgvector 扩展并创建所有表。
+
+    注意：Base.metadata.create_all() 不会迁移已有旧表。
+    开发环境如需重建表，请使用 sql/initSqlTable.sql。
+    """
     from ai_learning import models  # noqa: F401
 
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    with engine.begin() as connection:
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+    Base.metadata.create_all(bind=engine)
 
 
 def get_db() -> Generator[Session, None, None]:
