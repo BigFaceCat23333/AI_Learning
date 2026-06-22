@@ -1,4 +1,5 @@
 import httpx
+import logging
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
@@ -18,6 +19,8 @@ from ai_learning.models import DocumentChunk
 from ai_learning.rag.embedder import EmbeddingServiceError, get_embedding_client
 from ai_learning.rag.retriever import retrieve
 from ai_learning.services import save_uploaded_document
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -49,10 +52,18 @@ def upload_document(file: UploadFile, db: Session = Depends(get_db)) -> Document
 @router.post("/query", response_model=QueryResponse)
 def query(request: QueryRequest, db: Session = Depends(get_db)) -> QueryResponse:
     settings = get_settings()
+    if settings.rag_debug_logs:
+        logger.info(
+            "查询请求 | question_length=%d top_k=%d",
+            len(request.question),
+            request.top_k,
+        )
 
     # 检查是否有文档
     chunk_count = db.query(DocumentChunk).count()
     if chunk_count == 0:
+        if settings.rag_debug_logs:
+            logger.info("查询拒绝 | 原因=无文档")
         raise HTTPException(status_code=404, detail="No documents have been uploaded.")
 
     # 使用向量检索召回
@@ -81,6 +92,8 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> QueryResponse
 
     # 低相关度拒答
     if not results:
+        if settings.rag_debug_logs:
+            logger.info("查询拒答 | 原因=低相关度 阈值=%.2f", settings.retrieval_min_score)
         return QueryResponse(
             question=request.question,
             answer="文档中没有找到足够依据。",
@@ -117,10 +130,20 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> QueryResponse
     try:
         answer = LLMClient().complete(prompt)
     except ValueError as exc:
+        if settings.rag_debug_logs:
+            logger.warning("查询失败 | 原因=LLM配置缺失")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
+        if settings.rag_debug_logs:
+            logger.warning("查询失败 | 原因=LLM上游错误")
         raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}") from exc
 
+    if settings.rag_debug_logs:
+        logger.info(
+            "查询完成 | answer_length=%d source_count=%d",
+            len(answer),
+            len(sources),
+        )
     return QueryResponse(question=request.question, answer=answer, sources=sources)
 
 

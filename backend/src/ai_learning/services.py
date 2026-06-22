@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,6 +10,8 @@ from ai_learning.core.config import get_settings
 from ai_learning.models import Document, DocumentChunk
 from ai_learning.rag.embedder import EmbeddingServiceError, get_embedding_client
 from ai_learning.rag.loader import parse_text_file, split_chunks, validate_document_filename
+
+logger = logging.getLogger(__name__)
 
 
 def save_uploaded_document(file: UploadFile, db: Session) -> Document:
@@ -71,4 +74,17 @@ def save_uploaded_document(file: UploadFile, db: Session) -> Document:
     db.add(document)
     db.commit()
     db.refresh(document)
+
+    if settings.rag_debug_logs:
+        logger.info(
+            "文档上传完成 | filename=%s file_type=%s content_bytes=%d "
+            "raw_text_chars=%d chunk_count=%d document_id=%d",
+            filename,
+            file_type,
+            len(content),
+            len(raw_text),
+            len(document.chunks),
+            document.id,
+        )
+
     return document

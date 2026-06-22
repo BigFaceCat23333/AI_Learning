@@ -4,6 +4,7 @@
 score 统一为 "越大越相关"（1 - cosine_distance）。
 """
 
+import logging
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session, joinedload
@@ -11,6 +12,8 @@ from sqlalchemy.orm import Session, joinedload
 from ai_learning.core.config import get_settings
 from ai_learning.models import DocumentChunk
 from ai_learning.rag.embedder import EmbeddingClient, get_embedding_client
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,4 +80,23 @@ def retrieve(
 
     # 截取 top_k
     results.sort(key=lambda r: r.score, reverse=True)
-    return results[:top_k]
+    results = results[:top_k]
+
+    if settings.rag_debug_logs:
+        hit_summary = [
+            {"chunk_id": r.chunk.id, "document_id": r.chunk.document_id, "score": round(r.score, 4)}
+            for r in results
+        ]
+        logger.info(
+            "检索完成 | query_length=%d top_k=%d candidate_k=%d min_score=%.2f "
+            "candidate_count=%d result_count=%d hits=%s",
+            len(query),
+            top_k,
+            candidate_k,
+            min_score,
+            len(candidates),
+            len(results),
+            hit_summary,
+        )
+
+    return results

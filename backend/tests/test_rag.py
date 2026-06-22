@@ -10,6 +10,7 @@ from ai_learning.models import Document, DocumentChunk
 from ai_learning.rag.embedder import (
     EmbeddingServiceError,
     MockEmbeddingClient,
+    OpenAICompatibleEmbeddingClient,
     get_embedding_client,
 )
 from ai_learning.rag.loader import (
@@ -203,6 +204,51 @@ def test_openai_compatible_missing_config_raises() -> None:
         )
 
 
+def test_openai_compatible_sends_dimensions(monkeypatch) -> None:
+    """OpenAI 兼容接口请求应显式传递 dimensions，匹配 pgvector 表维度。"""
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "data": [
+                    {
+                        "embedding": [0.1] * 1536,
+                    }
+                ]
+            }
+
+    def fake_post(url: str, headers: dict, json: dict, timeout: int) -> FakeResponse:
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("ai_learning.rag.embedder.httpx.post", fake_post)
+    settings = Settings(
+        embedding_provider="openai_compatible",
+        embedding_base_url="https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        embedding_api_key="test-key",
+        embedding_model="text-embedding-v4",
+        embedding_dimensions=1536,
+    )
+
+    client = OpenAICompatibleEmbeddingClient(settings)
+    vectors = client.embed_texts(["hello"])
+
+    assert len(vectors) == 1
+    assert captured["url"].endswith("/compatible-mode/v1/embeddings")
+    assert captured["json"] == {
+        "model": "text-embedding-v4",
+        "input": ["hello"],
+        "dimensions": 1536,
+    }
+
+
 # ── retriever 测试 ──
 
 
@@ -362,3 +408,176 @@ def test_embedding_service_error_propagation(db_session, monkeypatch) -> None:
 
     assert response.status_code == 503
     assert "mock upstream embedding failure" in response.json()["detail"]
+
+
+# ── 配置默认值测试 ──
+
+
+def test_sql_echo_defaults_to_false() -> None:
+    """sql_echo 默认应为 False。"""
+    settings = Settings()
+    assert settings.sql_echo is False
+
+
+def test_rag_debug_logs_defaults_to_false() -> None:
+    """rag_debug_logs 默认应为 False。"""
+    settings = Settings()
+    assert settings.rag_debug_logs is False
+
+
+# ── 日志安全测试 ──
+
+
+def test_embedding_log_excludes_api_key(monkeypatch, caplog) -> None:
+    """Embedding 调试日志不应包含 API Key。"""
+    import logging
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "data": [
+                    {"embedding": [0.1] * 128},
+                ]
+            }
+
+    def fake_post(url: str, headers: dict, json: dict, timeout: int) -> FakeResponse:
+        return FakeResponse()
+
+    monkeypatch.setattr("ai_learning.rag.embedder.httpx.post", fake_post)
+    settings = Settings(
+        embedding_provider="openai_compatible",
+        embedding_base_url="https://api.example.com/v1",
+        embedding_api_key="sk-secret-do-not-leak",
+        embedding_dimensions=128,
+        rag_debug_logs=True,
+    )
+
+    caplog.set_level(logging.INFO)
+    client = OpenAICompatibleEmbeddingClient(settings)
+    client.embed_texts(["test input"])
+
+    log_text = caplog.text
+    assert "Embedding 调用成功" in log_text
+    assert "sk-secret-do-not-leak" not in log_text
+    assert "Bearer" not in log_text
+
+
+def test_embedding_no_logs_when_flag_disabled(monkeypatch, caplog) -> None:
+    """rag_debug_logs=False 时不输出 embedding 调用日志。"""
+    import logging
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": [{"embedding": [0.1] * 128}]}
+
+    def fake_post(url: str, headers: dict, json: dict, timeout: int) -> FakeResponse:
+        return FakeResponse()
+
+    monkeypatch.setattr("ai_learning.rag.embedder.httpx.post", fake_post)
+    settings = Settings(
+        embedding_provider="openai_compatible",
+        embedding_base_url="https://api.example.com/v1",
+        embedding_api_key="sk-secret",
+        embedding_dimensions=128,
+        rag_debug_logs=False,
+    )
+
+    caplog.set_level(logging.INFO)
+    client = OpenAICompatibleEmbeddingClient(settings)
+    client.embed_texts(["test"])
+
+    # 日志应不包含调用开始/成功信息
+    assert "Embedding 调用开始" not in caplog.text
+    assert "Embedding 调用成功" not in caplog.text
+
+
+def test_setup_logging_enables_info_when_flag_true(monkeypatch) -> None:
+    """rag_debug_logs=True 时，ai_learning logger 应启用 INFO 级别。"""
+    import logging
+    from ai_learning.main import setup_logging
+    from ai_learning.core.config import get_settings
+
+    # 先重置，确保初始状态
+    project_logger = logging.getLogger("ai_learning")
+    project_logger.setLevel(logging.WARNING)
+    for h in list(project_logger.handlers):
+        project_logger.removeHandler(h)
+
+    monkeypatch.setenv("AI_LEARNING_RAG_DEBUG_LOGS", "true")
+    get_settings.cache_clear()
+
+    setup_logging()
+
+    assert project_logger.isEnabledFor(logging.INFO) is True
+    assert project_logger.level == logging.INFO
+
+    get_settings.cache_clear()
+
+
+def test_setup_logging_keeps_warning_when_flag_false(monkeypatch) -> None:
+    """rag_debug_logs=False 时不应提升 ai_learning logger 级别。"""
+    import logging
+    from ai_learning.main import setup_logging
+    from ai_learning.core.config import get_settings
+
+    project_logger = logging.getLogger("ai_learning")
+    project_logger.setLevel(logging.WARNING)
+    for h in list(project_logger.handlers):
+        project_logger.removeHandler(h)
+
+    monkeypatch.setenv("AI_LEARNING_RAG_DEBUG_LOGS", "false")
+    get_settings.cache_clear()
+
+    setup_logging()
+
+    # 不应被改为 INFO
+    assert project_logger.level != logging.INFO
+
+    get_settings.cache_clear()
+
+
+def test_embedding_log_includes_status_code_on_http_error(monkeypatch, caplog) -> None:
+    """Embedding HTTP 4xx/5xx 失败日志应包含 status_code。"""
+    import logging
+    import httpx
+
+    class FakeResponse:
+        status_code = 429
+
+        def raise_for_status(self) -> None:
+            raise httpx.HTTPStatusError(
+                "Too Many Requests",
+                request=httpx.Request("POST", "https://api.example.com/v1/embeddings"),
+                response=httpx.Response(status_code=self.status_code),
+            )
+
+    def fake_post(url: str, headers: dict, json: dict, timeout: int) -> FakeResponse:
+        return FakeResponse()
+
+    monkeypatch.setattr("ai_learning.rag.embedder.httpx.post", fake_post)
+    settings = Settings(
+        embedding_provider="openai_compatible",
+        embedding_base_url="https://api.example.com/v1",
+        embedding_api_key="sk-test",
+        rag_debug_logs=True,
+    )
+
+    caplog.set_level(logging.WARNING)
+    client = OpenAICompatibleEmbeddingClient(settings)
+
+    try:
+        client.embed_texts(["test"])
+    except httpx.HTTPStatusError:
+        pass
+
+    log_text = caplog.text
+    assert "Embedding 调用失败" in log_text
+    assert "status_code=429" in log_text

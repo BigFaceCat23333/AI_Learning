@@ -14,7 +14,7 @@ class Base(DeclarativeBase):
 @lru_cache
 def get_engine():
     settings = get_settings()
-    return create_engine(settings.database_url)
+    return create_engine(settings.database_url, echo=settings.sql_echo)
 
 
 @lru_cache

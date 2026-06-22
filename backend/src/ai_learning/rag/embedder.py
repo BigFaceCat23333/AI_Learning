@@ -6,11 +6,15 @@
 """
 
 import hashlib
+import logging
+import time
 from abc import ABC, abstractmethod
 
 import httpx
 
 from ai_learning.core.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingServiceError(Exception):
@@ -50,16 +54,48 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        response = httpx.post(
-            self._url,
-            headers={"Authorization": f"Bearer {self._settings.embedding_api_key}"},
-            json={
-                "model": self._settings.embedding_model,
-                "input": texts,
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
+        settings = self._settings
+        url = self._url
+        start = time.perf_counter()
+        if settings.rag_debug_logs:
+            logger.info(
+                "Embedding 调用开始 | provider=openai_compatible base_url=%s model=%s "
+                "text_count=%d dimensions=%d",
+                url,
+                settings.embedding_model,
+                len(texts),
+                settings.embedding_dimensions,
+            )
+        try:
+            response = httpx.post(
+                url,
+                headers={"Authorization": f"Bearer {settings.embedding_api_key}"},
+                json={
+                    "model": settings.embedding_model,
+                    "input": texts,
+                    "dimensions": settings.embedding_dimensions,
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+        except httpx.HTTPStatusError as exc:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            if settings.rag_debug_logs:
+                logger.warning(
+                    "Embedding 调用失败 | status_code=%d elapsed_ms=%d",
+                    exc.response.status_code,
+                    elapsed_ms,
+                )
+            raise
+        except httpx.HTTPError:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            if settings.rag_debug_logs:
+                logger.warning(
+                    "Embedding 调用失败 | error_type=network elapsed_ms=%d",
+                    elapsed_ms,
+                )
+            raise
         payload = response.json()
         data = payload["data"]
         if len(data) != len(texts):
@@ -69,12 +105,19 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         vectors: list[list[float]] = []
         for item in data:
             vec = item["embedding"]
-            if len(vec) != self._settings.embedding_dimensions:
+            if len(vec) != settings.embedding_dimensions:
                 raise ValueError(
-                    f"Embedding dimension mismatch: expected {self._settings.embedding_dimensions}, "
+                    f"Embedding dimension mismatch: expected {settings.embedding_dimensions}, "
                     f"got {len(vec)}."
                 )
             vectors.append(vec)
+        if settings.rag_debug_logs:
+            logger.info(
+                "Embedding 调用成功 | vector_count=%d first_vector_dim=%d elapsed_ms=%d",
+                len(vectors),
+                len(vectors[0]),
+                elapsed_ms,
+            )
         return vectors
 
     def embed_query(self, query: str) -> list[float]:

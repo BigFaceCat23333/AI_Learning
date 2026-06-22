@@ -22,13 +22,17 @@ class Settings(BaseSettings):
     embedding_provider: str = "openai_compatible"
     embedding_base_url: str = ""
     embedding_api_key: Optional[str] = None
-    embedding_model: str = "text-embedding-3-small"
+    embedding_model: str = "text-embedding-v4"
     embedding_dimensions: int = 1536
 
     # 检索配置
     retrieval_min_score: float = 0.35
     retrieval_top_k: int = 5
     retrieval_candidate_k: int = 20
+
+    # 日志配置
+    sql_echo: bool = False
+    rag_debug_logs: bool = False
 
     model_config = SettingsConfigDict(
         env_prefix="AI_LEARNING_",

@@ -53,8 +53,9 @@ curl http://localhost:8000/api/health
 
 ```bash
 export AI_LEARNING_LLM_API_KEY="你的 LLM API Key"
-export AI_LEARNING_EMBEDDING_API_KEY="你的 Embedding API Key"
-export AI_LEARNING_EMBEDDING_BASE_URL="https://api.deepseek.com/v1"
+export AI_LEARNING_EMBEDDING_API_KEY="你的阿里云百炼 API Key"
+export AI_LEARNING_EMBEDDING_BASE_URL="https://your-workspace-id.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+export AI_LEARNING_EMBEDDING_MODEL="text-embedding-v4"
 ```
 
 ## 环境变量说明
@@ -66,9 +67,9 @@ export AI_LEARNING_EMBEDDING_BASE_URL="https://api.deepseek.com/v1"
 | `AI_LEARNING_LLM_API_KEY` | LLM API Key | - |
 | `AI_LEARNING_LLM_MODEL` | LLM 模型名 | `gpt-4.1-mini` |
 | `AI_LEARNING_EMBEDDING_PROVIDER` | Embedding 提供者 (`openai_compatible` 或 `mock`) | `openai_compatible` |
-| `AI_LEARNING_EMBEDDING_BASE_URL` | Embedding API 地址（需包含 `/v1`） | - |
-| `AI_LEARNING_EMBEDDING_API_KEY` | Embedding API Key | - |
-| `AI_LEARNING_EMBEDDING_MODEL` | Embedding 模型名 | `text-embedding-3-small` |
+| `AI_LEARNING_EMBEDDING_BASE_URL` | 阿里云百炼 OpenAI 兼容 Embedding API 地址（需包含 `/compatible-mode/v1`） | - |
+| `AI_LEARNING_EMBEDDING_API_KEY` | 阿里云百炼 API Key | - |
+| `AI_LEARNING_EMBEDDING_MODEL` | Embedding 模型名 | `text-embedding-v4` |
 | `AI_LEARNING_EMBEDDING_DIMENSIONS` | 向量维度 | `1536` |
 | `AI_LEARNING_RETRIEVAL_MIN_SCORE` | 检索最低相关度阈值 | `0.35` |
 | `AI_LEARNING_RETRIEVAL_TOP_K` | 返回结果数 | `5` |
@@ -157,9 +158,12 @@ cp .env.example .env
 ```env
 AI_LEARNING_DATABASE_URL=postgresql+psycopg://urpapa:postgres@host.docker.internal:5432/ai_learning
 AI_LEARNING_LLM_API_KEY=你的 API Key
-AI_LEARNING_EMBEDDING_API_KEY=你的 Embedding API Key
-AI_LEARNING_EMBEDDING_BASE_URL=https://api.deepseek.com/v1
+AI_LEARNING_EMBEDDING_API_KEY=你的阿里云百炼 API Key
+AI_LEARNING_EMBEDDING_BASE_URL=https://your-workspace-id.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+AI_LEARNING_EMBEDDING_MODEL=text-embedding-v4
 ```
+
+其中 `your-workspace-id` 需要替换为阿里云百炼业务空间 ID；如果使用新加坡地域，按百炼控制台提供的地域域名替换整个 `AI_LEARNING_EMBEDDING_BASE_URL`。
 
 启动 Docker 服务：
 
@@ -186,6 +190,33 @@ docker compose up --build -d
 ```bash
 docker compose down
 ```
+
+## 查看后端日志
+
+Docker 运行时可查看后端运行日志：
+
+```bash
+# 实时跟踪后端日志
+docker compose logs -f backend
+
+# 查看最近 200 行
+docker compose logs --tail=200 backend
+```
+
+如需查看模型调用链路（embedding / LLM）和 RAG 检索命中详情，可在 `.env` 中启用调试日志：
+
+```env
+AI_LEARNING_RAG_DEBUG_LOGS=true
+AI_LEARNING_SQL_ECHO=true
+```
+
+修改后重建并重启后端：
+
+```bash
+docker compose up --build -d --force-recreate backend
+```
+
+> **注意**：`AI_LEARNING_SQL_ECHO=true` 会输出 SQLAlchemy 生成的 SQL 语句和参数，可能包含部分业务数据，不建议生产环境长期开启。
 
 ## 使用流程
 
