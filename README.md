@@ -75,6 +75,84 @@ export AI_LEARNING_EMBEDDING_MODEL="text-embedding-v4"
 | `AI_LEARNING_RETRIEVAL_TOP_K` | 返回结果数 | `5` |
 | `AI_LEARNING_RETRIEVAL_CANDIDATE_K` | 候选召回数 | `20` |
 | `AI_LEARNING_UPLOAD_MAX_BYTES` | 上传文件大小限制 | `5242880` (5MB) |
+| `AI_LEARNING_AUTH_SECRET` | 认证 JWT 签名密钥（必填，至少 32 字符） | - |
+| `AI_LEARNING_AUTH_TOKEN_TTL_SECONDS` | JWT 有效期（秒） | `28800` (8 小时) |
+| `AI_LEARNING_AUTH_COOKIE_SECURE` | Cookie Secure 属性（公网 HTTPS 必须为 true） | `false` |
+
+## 认证与用户隔离
+
+### 初始登录凭证
+
+部署后使用以下凭证登录：
+- 用户名：`admin`
+- 密码：由部署者在生成 `AI_LEARNING_AUTH_SECRET` 时同步生成，详见下方部署步骤。
+
+### 首次部署（全新数据库）
+
+1. 准备 PostgreSQL 数据库。
+2. 执行 `sql/initSqlTable.sql` 初始化所有表（含预置 admin 用户哈希）。
+3. 复制 `.env.example` → `.env`，填写 `AI_LEARNING_AUTH_SECRET` 及其他配置。
+4. 启动后端和前端容器。
+
+### 现有 Docker 部署重新初始化（含旧知识库）
+
+> ⚠️ 升级会清空现有知识库文档和分片数据。执行前确保所有业务访问已停止。
+
+1. **停止业务访问**：
+   ```bash
+   docker compose down
+   ```
+
+2. **配置认证密钥**：
+   在项目根目录 `.env` 中添加以下认证配置（密钥需至少 32 字符）：
+   ```bash
+   # 生成强随机密钥
+   python -c "import secrets; print(secrets.token_urlsafe(32))"
+   ```
+   ```env
+   AI_LEARNING_AUTH_SECRET=<生成的密钥>
+   AI_LEARNING_AUTH_TOKEN_TTL_SECONDS=28800
+   # 本地 HTTP：
+   AI_LEARNING_AUTH_COOKIE_SECURE=false
+   # 公网 HTTPS：
+   # AI_LEARNING_AUTH_COOKIE_SECURE=true
+   ```
+
+3. **重新初始化数据库**（会删除并重建所有业务表）：
+   ```bash
+   psql -h localhost -p 5432 -U urpapa -d ai_learning -f sql/initSqlTable.sql
+   ```
+
+4. **清理旧上传文件**：
+   ```bash
+   docker volume rm ai-learning_backend_uploads
+   ```
+
+5. **重建并启动容器**：
+   ```bash
+   docker compose up --build -d
+   ```
+
+6. **生成新的 admin 密码**并替换 SQL 中的哈希（如使用全新部署则跳过）：
+   ```bash
+   cd backend
+   uv run python -c "
+   from ai_learning.auth import hash_password, generate_random_password
+   pwd = generate_random_password()
+   print(f'新 admin 密码: {pwd}')
+   print(f'新 admin 哈希: {hash_password(pwd)}')
+   # 将哈希更新到 sql/initSqlTable.sql 的 INSERT 语句中
+   # 然后在数据库中执行 UPDATE users SET password_hash = '<新哈希>' WHERE username = 'admin';
+   "
+   ```
+
+### 本地与公网 Cookie 配置
+
+| 部署场景 | `AI_LEARNING_AUTH_COOKIE_SECURE` | 说明 |
+|----------|----------------------------------|------|
+| 本地 HTTP 开发 | `false` | Cookie 通过 HTTP 传输 |
+| Docker 本地测试 | `false` | `localhost:3000` 访问 |
+| 公网 HTTPS 部署 | `true` | Cookie 仅通过 HTTPS 传输 |
 
 ## 前端启动
 

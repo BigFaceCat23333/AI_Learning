@@ -1,19 +1,47 @@
 import { type ChangeEvent, type DragEvent, useState, useRef } from "react";
-import type { DocumentUploadResponse } from "../types/api";
-import { uploadDocument } from "../api/client";
+import type { DocumentListItem, DocumentUploadResponse } from "../types/api";
+import { downloadDocument, uploadDocument } from "../api/client";
 
 const ALLOWED_TYPES = [".txt", ".md"];
 const MAX_SIZE = 5 * 1024 * 1024; // 5MB
 
 interface UploadPanelProps {
   onUploadSuccess: () => void;
+  documents: DocumentListItem[];
+  listLoading: boolean;
+  listError: string | null;
+  onRetry: () => void;
 }
 
-export default function UploadPanel({ onUploadSuccess }: UploadPanelProps) {
+/** 格式化 ISO 时间为本地可读字符串 */
+function formatTime(iso: string): string {
+  try {
+    const date = new Date(iso);
+    return date.toLocaleString("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+export default function UploadPanel({
+  onUploadSuccess,
+  documents,
+  listLoading,
+  listError,
+  onRetry,
+}: UploadPanelProps) {
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DocumentUploadResponse | null>(null);
+  const [downloadingIds, setDownloadingIds] = useState<Set<number>>(new Set());
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   function validateFile(file: File): string | null {
@@ -79,6 +107,24 @@ export default function UploadPanel({ onUploadSuccess }: UploadPanelProps) {
     fileInputRef.current?.click();
   }
 
+  async function handleDownload(doc: DocumentListItem) {
+    setDownloadError(null);
+    setDownloadingIds((prev) => new Set(prev).add(doc.document_id));
+    try {
+      await downloadDocument(doc.document_id, doc.filename);
+    } catch (err) {
+      setDownloadError(
+        err instanceof Error ? err.message : "下载失败",
+      );
+    } finally {
+      setDownloadingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(doc.document_id);
+        return next;
+      });
+    }
+  }
+
   return (
     <div className="upload-panel">
       <h3 className="panel-title">📄 文档上传</h3>
@@ -126,6 +172,71 @@ export default function UploadPanel({ onUploadSuccess }: UploadPanelProps) {
           </ul>
         </div>
       )}
+
+      {/* 知识库文件列表 */}
+      <h3 className="panel-title doc-list-title">📚 知识库文件</h3>
+
+      <div className="doc-list">
+        {listLoading && (
+          <div className="doc-list-status">⏳ 加载中...</div>
+        )}
+
+        {listError && !listLoading && (
+          <div className="doc-list-error">
+            <span>❌ {listError}</span>
+            <button
+              type="button"
+              className="doc-retry-button"
+              onClick={onRetry}
+            >
+              重试
+            </button>
+          </div>
+        )}
+
+        {!listLoading && !listError && documents.length === 0 && (
+          <div className="doc-list-empty">
+            暂无文档，上传后在此展示。
+          </div>
+        )}
+
+        {!listLoading && !listError && documents.length > 0 && (
+          <ul className="doc-items">
+            {documents.map((doc) => {
+              const isDownloading = downloadingIds.has(doc.document_id);
+              return (
+                <li key={doc.document_id} className="doc-item">
+                  <div className="doc-item-info">
+                    <span className="doc-item-name" title={doc.filename}>
+                      {doc.filename}
+                    </span>
+                    <span className="doc-item-meta">
+                      <span className="doc-item-type">{doc.file_type.toUpperCase()}</span>
+                      <span className="doc-item-chunks">{doc.chunk_count} 分片</span>
+                      <span className="doc-item-time">
+                        {formatTime(doc.created_at)}
+                      </span>
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="doc-download-button"
+                    disabled={isDownloading}
+                    onClick={() => handleDownload(doc)}
+                    title={isDownloading ? "下载中..." : "下载原文件"}
+                  >
+                    {isDownloading ? "⏳" : "⬇"}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        {downloadError && (
+          <div className="doc-download-error">❌ {downloadError}</div>
+        )}
+      </div>
     </div>
   );
 }
