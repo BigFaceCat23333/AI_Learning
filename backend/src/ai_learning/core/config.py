@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     sql_echo: bool = False
     rag_debug_logs: bool = False
 
+    # 认证配置
+    auth_secret: str = ""
+    auth_token_ttl_seconds: int = 28800
+    auth_cookie_secure: bool = False
+    auth_cookie_name: str = "ai_learning_session"
+
     model_config = SettingsConfigDict(
         env_prefix="AI_LEARNING_",
         env_file=".env",

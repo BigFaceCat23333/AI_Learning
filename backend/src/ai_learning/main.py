@@ -1,11 +1,12 @@
 import logging
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from ai_learning.api.routes import router
+from ai_learning.api.routes import auth_router, router
 from ai_learning.core.config import get_settings
 from ai_learning.db import init_db
 
@@ -36,8 +37,24 @@ def setup_logging() -> None:
             project_logger.addHandler(handler)
 
 
+def _validate_auth_secret() -> None:
+    """启动时校验认证密钥；缺失或不足 32 字符时拒绝启动。"""
+    settings = get_settings()
+    secret = settings.auth_secret
+    if not secret or len(secret) < 32:
+        sys.exit(
+            "FATAL: AI_LEARNING_AUTH_SECRET is missing or shorter than 32 characters. "
+            "Generate a strong random secret and set it via environment variable or .env file."
+        )
+    if settings.auth_token_ttl_seconds <= 0:
+        sys.exit(
+            "FATAL: AI_LEARNING_AUTH_TOKEN_TTL_SECONDS must be greater than 0."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    _validate_auth_secret()
     init_db()
     yield
 
@@ -53,6 +70,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.include_router(auth_router, prefix="/api")
     app.include_router(router, prefix="/api")
     return app
 

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session, joinedload
 
 from ai_learning.core.config import get_settings
-from ai_learning.models import DocumentChunk
+from ai_learning.models import Document, DocumentChunk
 from ai_learning.rag.embedder import EmbeddingClient, get_embedding_client
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,7 @@ def retrieve(
     top_k: int | None = None,
     candidate_k: int | None = None,
     min_score: float | None = None,
+    user_id: int | None = None,
 ) -> list[RetrievalResult]:
     """使用 pgvector 向量检索召回最相关的 chunk。
 
@@ -61,12 +62,19 @@ def retrieve(
     # 通过 comparator 访问 <=> 运算符，返回余弦距离（越小越相似）
     # score = 1 - distance 转换为越大越相关
     distance_expr = DocumentChunk.embedding.cosine_distance(query_embedding)
-    candidates = (
+    query_base = (
         db.query(
             DocumentChunk,
             distance_expr.label("distance"),
         )
+        .join(Document, DocumentChunk.document_id == Document.id)
         .options(joinedload(DocumentChunk.document))
+    )
+    # 用户隔离：按 user_id 过滤（必须在 limit/order 之前）
+    if user_id is not None:
+        query_base = query_base.filter(Document.user_id == user_id)
+    candidates = (
+        query_base
         .order_by(distance_expr)
         .limit(candidate_k)
         .all()

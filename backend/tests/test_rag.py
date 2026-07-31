@@ -6,7 +6,7 @@ from sqlalchemy import text
 
 from ai_learning.core.config import Settings, get_settings
 from ai_learning.db import Base, get_engine, get_session_factory
-from ai_learning.models import Document, DocumentChunk
+from ai_learning.models import Document, DocumentChunk, User
 from ai_learning.rag.embedder import (
     EmbeddingServiceError,
     MockEmbeddingClient,
@@ -24,6 +24,19 @@ from ai_learning.rag.retriever import retrieve
 POSTGRES_TEST_DATABASE_URL = (
     "postgresql+psycopg://urpapa:postgres@localhost:5432/ai_learning_test"
 )
+
+
+def _create_test_user(session) -> User:
+    """在测试数据库中创建一个活跃用户。"""
+    from ai_learning.auth import hash_password
+    user = User(
+        username="admin",
+        password_hash=hash_password("test-password"),
+        is_active=True,
+    )
+    session.add(user)
+    session.commit()
+    return user
 
 
 @pytest.fixture
@@ -48,10 +61,12 @@ def db_session(monkeypatch, tmp_path) -> Generator:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         conn.execute(text("DROP TABLE IF EXISTS document_chunks CASCADE"))
         conn.execute(text("DROP TABLE IF EXISTS documents CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS users CASCADE"))
     import ai_learning.models  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
     session = get_session_factory()()
+    _create_test_user(session)
     yield session
     session.close()
 
@@ -59,6 +74,7 @@ def db_session(monkeypatch, tmp_path) -> Generator:
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS document_chunks CASCADE"))
         conn.execute(text("DROP TABLE IF EXISTS documents CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS users CASCADE"))
 
     get_settings.cache_clear()
     get_engine.cache_clear()
@@ -281,7 +297,8 @@ def test_retrieve_returns_results_sorted_by_score(db_session) -> None:
     settings = get_settings()
     embedder = MockEmbeddingClient(settings)
 
-    doc = Document(filename="test.md", file_type="md", saved_path="/tmp/test.md", raw_text="test")
+    user_id = db_session.query(User).first().id
+    doc = Document(user_id=user_id, filename="test.md", file_type="md", saved_path="/tmp/test.md", raw_text="test")
     # chunk2 的文本与查询文本更接近（完全匹配），mock embedding 会产生相同的向量
     query = "python fastapi service"
     chunks_data = [
@@ -315,7 +332,8 @@ def test_retrieve_top_k_limits_results(db_session) -> None:
     settings = get_settings()
     embedder = MockEmbeddingClient(settings)
 
-    doc = Document(filename="multi.md", file_type="md", saved_path="/tmp/multi.md", raw_text="multi")
+    user_id = db_session.query(User).first().id
+    doc = Document(user_id=user_id, filename="multi.md", file_type="md", saved_path="/tmp/multi.md", raw_text="multi")
     doc.chunks = [
         _make_chunk(doc, i, f"chunk content number {i}", embedder.embed_query(f"chunk {i}"))
         for i in range(10)
@@ -333,7 +351,8 @@ def test_retrieve_min_score_filters_low_relevance(db_session) -> None:
     settings = get_settings()
     embedder = MockEmbeddingClient(settings)
 
-    doc = Document(filename="note.md", file_type="md", saved_path="/tmp/note.md", raw_text="note")
+    user_id = db_session.query(User).first().id
+    doc = Document(user_id=user_id, filename="note.md", file_type="md", saved_path="/tmp/note.md", raw_text="note")
     doc.chunks = [
         _make_chunk(doc, 0, "天气很好适合出去玩", embedder.embed_query("天气很好适合出去玩")),
     ]
@@ -362,7 +381,8 @@ def test_retrieve_defaults_from_settings(db_session) -> None:
     settings = get_settings()
     embedder = MockEmbeddingClient(settings)
 
-    doc = Document(filename="default.md", file_type="md", saved_path="/tmp/default.md", raw_text="default")
+    user_id = db_session.query(User).first().id
+    doc = Document(user_id=user_id, filename="default.md", file_type="md", saved_path="/tmp/default.md", raw_text="default")
     doc.chunks = [
         _make_chunk(doc, i, f"content {i}", embedder.embed_query(f"content {i}"))
         for i in range(10)
@@ -381,21 +401,28 @@ def test_embedding_service_error_propagation(db_session, monkeypatch) -> None:
     from fastapi.testclient import TestClient
     from ai_learning.main import create_app
     from ai_learning.core.llm_client import LLMClient
+    from ai_learning.auth import create_token
+    from ai_learning.core.config import get_settings as _get_settings
 
     monkeypatch.setenv("AI_LEARNING_EMBEDDING_PROVIDER", "mock")
-    get_settings.cache_clear()
+    monkeypatch.setenv("AI_LEARNING_AUTH_SECRET", "test-secret-key-at-least-32-chars-long!!")
+    _get_settings.cache_clear()
 
-    # 上传文档
     app = create_app()
     client = TestClient(app)
+
+    # 创建用户并登录获取 Cookie
+    user = db_session.query(User).first()
+    token = create_token(user.id)
+
+    # 上传文档
     client.post(
         "/api/documents/upload",
         files={"file": ("demo.md", "FastAPI 测试文档内容。".encode("utf-8"), "text/markdown")},
+        cookies={_get_settings().auth_cookie_name: token},
     )
 
     # mock embed_query 抛出 EmbeddingServiceError
-    import ai_learning.api.routes as routes_module
-
     def _failing_embed_query(self, query: str) -> list[float]:
         raise EmbeddingServiceError("mock upstream embedding failure")
 
@@ -404,10 +431,16 @@ def test_embedding_service_error_propagation(db_session, monkeypatch) -> None:
     )
 
     monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "should not be called")
-    response = client.post("/api/query", json={"question": "测试？", "top_k": 1})
+    response = client.post(
+        "/api/query",
+        json={"question": "测试？", "top_k": 1},
+        cookies={_get_settings().auth_cookie_name: token},
+    )
 
     assert response.status_code == 503
     assert "mock upstream embedding failure" in response.json()["detail"]
+
+    _get_settings.cache_clear()
 
 
 # ── 配置默认值测试 ──
@@ -542,6 +575,66 @@ def test_setup_logging_keeps_warning_when_flag_false(monkeypatch) -> None:
     assert project_logger.level != logging.INFO
 
     get_settings.cache_clear()
+
+
+def test_retrieve_user_id_isolation(db_session) -> None:
+    """retrieve 传入 user_id 时应过滤其他用户分片。"""
+    from ai_learning.auth import hash_password as hp
+    from ai_learning.rag.embedder import MockEmbeddingClient
+
+    settings = get_settings()
+    embedder = MockEmbeddingClient(settings)
+
+    # 获取或创建两个用户
+    existing_user = db_session.query(User).first()
+    u2 = User(
+        username="user2_retrieve",
+        password_hash=hp("test"),
+        is_active=True,
+    )
+    db_session.add(u2)
+    db_session.commit()
+
+    # 每个用户创建一个文档
+    doc1 = Document(user_id=existing_user.id, filename="u1.md", file_type="md", saved_path="/tmp/u1.md", raw_text="u1")
+    doc1.chunks = [
+        DocumentChunk(
+            document=doc1, chunk_index=0, chunk_text="admin specific about databases",
+            embedding=embedder.embed_query("admin specific about databases"),
+            chunk_metadata={"filename": "u1.md", "file_type": "md", "chunk_index": 0, "char_start": 0, "char_end": 10},
+            content_hash="a1", char_count=10,
+        )
+    ]
+    db_session.add(doc1)
+
+    user2_text = "user2 specific about frontend"
+    doc2 = Document(user_id=u2.id, filename="u2.md", file_type="md", saved_path="/tmp/u2.md", raw_text="u2")
+    doc2.chunks = [
+        DocumentChunk(
+            document=doc2, chunk_index=0, chunk_text=user2_text,
+            embedding=embedder.embed_query(user2_text),
+            chunk_metadata={"filename": "u2.md", "file_type": "md", "chunk_index": 0, "char_start": 0, "char_end": len(user2_text)},
+            content_hash="b2", char_count=len(user2_text),
+        )
+    ]
+    db_session.add(doc2)
+    db_session.commit()
+
+    # 以 existing_user 身份检索：查询 admin 的文档内容
+    results = retrieve(query="admin specific about databases", db=db_session, embedder=embedder, user_id=existing_user.id, top_k=10, min_score=0.0)
+
+    assert len(results) >= 1
+    for r in results:
+        assert r.chunk.document.user_id == existing_user.id
+        assert r.chunk.document.filename != "u2.md"
+
+    # 以 u2 身份检索：用完全相同的文本查询确保 mock embedding 精确匹配
+    results2 = retrieve(query=user2_text, db=db_session, embedder=embedder, user_id=u2.id, top_k=10, min_score=0.0)
+
+    assert len(results2) >= 1
+    for r in results2:
+        assert r.chunk.document.user_id == u2.id
+        assert r.chunk.document.filename != "u1.md"
 
 
 def test_embedding_log_includes_status_code_on_http_error(monkeypatch, caplog) -> None:

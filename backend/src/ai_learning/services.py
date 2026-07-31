@@ -14,7 +14,7 @@ from ai_learning.rag.loader import parse_text_file, split_chunks, validate_docum
 logger = logging.getLogger(__name__)
 
 
-def save_uploaded_document(file: UploadFile, db: Session) -> Document:
+def save_uploaded_document(file: UploadFile, db: Session, user_id: int) -> Document:
     """上传并入库文档：解析、分块、生成 embedding、保存。"""
     settings = get_settings()
     filename = Path(file.filename or "").name
@@ -55,6 +55,7 @@ def save_uploaded_document(file: UploadFile, db: Session) -> Document:
 
     # 创建 Document 和 DocumentChunk
     document = Document(
+        user_id=user_id,
         filename=filename,
         file_type=file_type,
         saved_path=str(saved_path),
@@ -77,8 +78,9 @@ def save_uploaded_document(file: UploadFile, db: Session) -> Document:
 
     if settings.rag_debug_logs:
         logger.info(
-            "文档上传完成 | filename=%s file_type=%s content_bytes=%d "
+            "文档上传完成 | user_id=%d filename=%s file_type=%s content_bytes=%d "
             "raw_text_chars=%d chunk_count=%d document_id=%d",
+            user_id,
             filename,
             file_type,
             len(content),
