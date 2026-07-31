@@ -1,9 +1,15 @@
 import httpx
 import logging
+import os
+import re
+import secrets
+import tempfile
+from io import BytesIO
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response as FastAPIResponse
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy.orm import Session, selectinload
 
 from ai_learning.agent.graph import run_agent
@@ -14,6 +20,8 @@ from ai_learning.api.schemas import (
     DocumentUploadResponse,
     LoginRequest,
     LoginResponse,
+    PasswordChangeRequest,
+    ProfileUpdateRequest,
     QueryRequest,
     QueryResponse,
     QuerySource,
@@ -22,9 +30,13 @@ from ai_learning.api.schemas import (
 from ai_learning.auth import (
     clear_auth_cookie,
     create_token,
+    generate_captcha,
     get_current_user,
+    hash_password,
     set_auth_cookie,
+    verify_and_consume_captcha,
     verify_login_password,
+    verify_password,
 )
 from ai_learning.core.config import get_settings
 from ai_learning.core.llm_client import LLMClient
@@ -40,6 +52,32 @@ router = APIRouter()
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+# ── 辅助函数 ──
+
+
+def _build_user_response(user: User) -> dict:
+    """构建包含资料字段和头像 URL 的用户响应字典。"""
+    settings = get_settings()
+    avatar_url = None
+    if user.avatar_path:
+        # 使用微秒级时间戳确保快速连续替换时版本号也不同
+        ts_us = int(user.updated_at.timestamp() * 1_000_000)
+        avatar_url = f"/auth/me/avatar?v={ts_us}"
+    return {
+        "user_id": user.id,
+        "username": user.username,
+        "display_name": user.display_name,
+        "email": user.email,
+        "phone": user.phone,
+        "bio": user.bio,
+        "avatar_url": avatar_url,
+    }
+
+
+_EMAIL_RE = re.compile(r"^[^@]+@[^@]+\.[^@]+$")
+_PHONE_RE = re.compile(r"^[0-9 +\-()]{1,32}$")
+
+
 # ── 公开接口 ──
 
 
@@ -53,13 +91,18 @@ def health() -> dict[str, str]:
 
 @auth_router.post("/login", response_model=LoginResponse)
 def login(request: LoginRequest, response: Response, db: Session = Depends(get_db)) -> LoginResponse:
-    """用户名密码登录，成功后设置 HttpOnly Cookie。
+    """用户名密码登录，先校验验证码再校验密码，成功后设置 HttpOnly Cookie。
 
     始终执行 Argon2 密码校验以消除用户名时序枚举：
     - 存在且活跃用户使用真实 hash 校验
     - 不存在或停用用户使用固定 dummy hash 校验
     - 最终所有失败路径统一返回相同 401 文案。
     """
+    # 1. 校验并消费验证码（消费状态在 verify_and_consume_captcha 内部已提交）
+    if not verify_and_consume_captcha(db, request.captcha_id, request.captcha_code):
+        raise HTTPException(status_code=400, detail="验证码错误或已过期，请刷新后重试。")
+
+    # 2. 用户名密码校验
     username = request.username.strip().lower()
 
     user = db.query(User).filter(User.username == username).first()
@@ -74,7 +117,7 @@ def login(request: LoginRequest, response: Response, db: Session = Depends(get_d
     token = create_token(user.id)  # type: ignore[union-attr]
     set_auth_cookie(response, token)
 
-    return LoginResponse(user_id=user.id, username=user.username)  # type: ignore[union-attr]
+    return LoginResponse(**_build_user_response(user))  # type: ignore[union-attr]
 
 
 @auth_router.post("/logout", status_code=204)
@@ -89,7 +132,261 @@ def logout(
 @auth_router.get("/me", response_model=UserMeResponse)
 def me(user: User = Depends(get_current_user)) -> UserMeResponse:
     """返回当前已登录用户信息。"""
-    return UserMeResponse(user_id=user.id, username=user.username)
+    return UserMeResponse(**_build_user_response(user))
+
+
+# ── 验证码接口 ──
+
+
+@auth_router.get("/captcha")
+def captcha(db: Session = Depends(get_db)) -> Response:
+    """生成验证码图片，返回 image/png，通过 X-Captcha-Id 头返回挑战 ID。"""
+    captcha_id, png_bytes = generate_captcha(db)
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={
+            "X-Captcha-Id": captcha_id,
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+    )
+
+
+# ── 个人资料接口 ──
+
+
+@auth_router.put("/me/profile", response_model=UserMeResponse)
+def update_profile(
+    body: ProfileUpdateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UserMeResponse:
+    """更新当前用户的个人资料。"""
+    # 邮箱格式校验
+    if body.email is not None and not _EMAIL_RE.match(body.email):
+        raise HTTPException(status_code=400, detail="邮箱格式不正确。")
+
+    # 手机号字符校验
+    if body.phone is not None and not _PHONE_RE.match(body.phone):
+        raise HTTPException(status_code=400, detail="手机号包含无效字符。")
+
+    user.display_name = body.display_name
+    user.email = body.email
+    user.phone = body.phone
+    user.bio = body.bio
+    db.commit()
+    db.refresh(user)
+
+    return UserMeResponse(**_build_user_response(user))
+
+
+# ── 头像接口 ──
+
+
+def _avatar_root() -> Path:
+    """头像根目录：从 upload_dir 派生，保证 Docker 持久化一致。"""
+    settings = get_settings()
+    return Path(settings.upload_dir) / "avatars"
+
+
+def _resolve_avatar_path(user_avatar_path: str | None) -> tuple[Path, Path] | None:
+    """安全解析头像路径：返回 (absolute_path, avatar_root)。
+
+    仅用于 GET/DELETE；数据库存的是相对路径（如 avatars/1.webp）。
+    """
+    if not user_avatar_path:
+        return None
+    root = _avatar_root().resolve()
+    resolved = root / Path(user_avatar_path).name
+    try:
+        resolved.resolve().relative_to(root)
+    except ValueError:
+        return None
+    return resolved, root
+
+
+def _validate_and_process_avatar(file: UploadFile) -> bytes:
+    """校验并处理头像上传：防御伪造/损坏/解压炸弹，验证图片、缩放、转 WebP。
+
+    所有 Pillow 操作在受控异常边界内执行，任何异常转为 400。
+    """
+    import warnings
+
+    settings = get_settings()
+
+    # 限制读取大小（2 MB）
+    raw = file.file.read(settings.avatar_max_bytes + 1)
+    if len(raw) > settings.avatar_max_bytes:
+        raise HTTPException(status_code=400, detail="头像文件大小不能超过 2 MB。")
+
+    # 保守像素上限：4096×4096 = 16.7M 像素，匹配服务内存预算
+    max_pixels = 4096 * 4096
+
+    from PIL import Image as PILImage
+
+    try:
+        # 第一阶段：验证图片完整性并检测格式伪造
+        img = PILImage.open(BytesIO(raw))
+        img.verify()
+    except (UnidentifiedImageError, Exception):
+        raise HTTPException(status_code=400, detail="无法识别的图片格式，请上传 JPEG、PNG 或 WebP。")
+
+    # 局部 warning 上下文：把 DecompressionBombWarning 转为 400
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", PILImage.DecompressionBombWarning)
+        try:
+            # 第二阶段：重新打开并完整解码
+            img = PILImage.open(BytesIO(raw))
+            if img.format not in ("JPEG", "PNG", "WEBP"):
+                raise HTTPException(status_code=400, detail="仅支持 JPEG、PNG、WebP 格式。")
+
+            # 预检总像素（在完整解码前拒绝）
+            w, h = img.size
+            if w * h > max_pixels:
+                raise HTTPException(status_code=400, detail="图片像素过大。")
+
+            # 完整加载像素数据（通过 DecompressionBombWarning 防护）
+            img.load()
+
+            # EXIF 方向纠正
+            from PIL import ImageOps
+            img = ImageOps.exif_transpose(img)
+
+            # 转换为 RGB/RGBA
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGBA")
+
+            # 缩放到最长边不超过 max_pixels
+            max_dim = max(img.size)
+            if max_dim > settings.avatar_max_pixels:
+                ratio = settings.avatar_max_pixels / max_dim
+                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+                img = img.resize(new_size, PILImage.LANCZOS)
+
+            # 转 WebP
+            out = BytesIO()
+            img.save(out, format="WEBP", quality=85)
+            return out.getvalue()
+
+        except PILImage.DecompressionBombWarning:
+            raise HTTPException(status_code=400, detail="图片像素过大。")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=400, detail="图片处理失败，请确认上传的是有效图片。")
+
+
+@auth_router.put("/me/avatar", response_model=UserMeResponse)
+def upload_avatar(
+    file: UploadFile,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UserMeResponse:
+    """上传/替换当前用户头像。
+
+    - 固定目标文件名 avatars/{user_id}.webp
+    - 同目录临时文件 + os.replace 原子替换
+    - 数据库存储受控相对路径
+    """
+    # 校验并处理图片
+    webp_bytes = _validate_and_process_avatar(file)
+
+    # 确保头像目录存在
+    avatar_root = _avatar_root()
+    avatar_root.mkdir(parents=True, exist_ok=True)
+
+    # 固定目标文件名
+    target = avatar_root / f"{user.id}.webp"
+
+    # 同目录临时文件 + 原子替换
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(avatar_root), suffix=".webp")
+    try:
+        with open(tmp_fd, "wb") as f:
+            f.write(webp_bytes)
+        os.replace(tmp_path, str(target))  # 原子替换：POSIX rename
+    except Exception:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="头像保存失败。")
+
+    # 数据库存受控相对路径；显式更新时间戳确保版本号变化
+    from datetime import datetime as _dt
+    user.avatar_path = f"avatars/{user.id}.webp"
+    user.updated_at = _dt.utcnow()  # type: ignore[assignment]
+    db.commit()
+    db.refresh(user)
+
+    return UserMeResponse(**_build_user_response(user))
+
+
+@auth_router.delete("/me/avatar", response_model=UserMeResponse)
+def delete_avatar(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UserMeResponse:
+    """删除当前用户头像。文件不存在时幂等成功。
+
+    使用与 GET 相同的安全路径解析，防止目录遍历。
+    """
+    if user.avatar_path:
+        resolved = _resolve_avatar_path(user.avatar_path)
+        if resolved is not None:
+            avatar_path, _root = resolved
+            avatar_path.unlink(missing_ok=True)
+        user.avatar_path = None
+        db.commit()
+        db.refresh(user)
+
+    return UserMeResponse(**_build_user_response(user))
+
+
+@auth_router.get("/me/avatar")
+def get_avatar(user: User = Depends(get_current_user)) -> FileResponse:
+    """返回当前用户头像。无头像或文件不存在返回 404。"""
+    if not user.avatar_path:
+        raise HTTPException(status_code=404, detail="头像不存在。")
+
+    resolved = _resolve_avatar_path(user.avatar_path)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="头像不存在。")
+    avatar_path, _root = resolved
+
+    if not avatar_path.is_file():
+        raise HTTPException(status_code=404, detail="头像不存在。")
+
+    return FileResponse(
+        path=str(avatar_path),
+        media_type="image/webp",
+    )
+
+
+# ── 修改密码接口 ──
+
+
+@auth_router.put("/me/password", status_code=204)
+def change_password(
+    body: PasswordChangeRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    """修改当前用户密码，成功后清除认证 Cookie。"""
+    # 校验当前密码
+    if not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="当前密码错误。")
+
+    # 新旧密码相同
+    if body.current_password == body.new_password:
+        raise HTTPException(status_code=400, detail="新密码不能与当前密码相同。")
+
+    # 更新密码
+    user.password_hash = hash_password(body.new_password)
+    db.commit()
+
+    # 清除认证 Cookie，要求重新登录
+    clear_auth_cookie(response)
 
 
 # ── 业务接口（均需认证）──

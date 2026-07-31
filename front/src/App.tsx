@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { DocumentListItem, UserInfo } from "./types/api";
-import { getMe, listDocuments, logout, setOnUnauthorized } from "./api/client";
+import { getAvatarUrl, getMe, listDocuments, logout, setOnUnauthorized } from "./api/client";
 import LoginPage from "./components/LoginPage";
+import ProfileSettings from "./components/ProfileSettings";
 import UploadPanel from "./components/UploadPanel";
 import ChatPanel from "./components/ChatPanel";
 
 /** 页面初始状态 */
 type AuthPhase =
   | { tag: "checking" }
-  | { tag: "logged-out" }
+  | { tag: "logged-out"; successMessage?: string | null }
   | { tag: "error"; message: string }
   | { tag: "logged-in"; user: UserInfo };
 
@@ -28,18 +29,29 @@ export default function App() {
   const [listLoading, setListLoading] = useState(true);
   const [listError, setListError] = useState<string | null>(null);
   const [hasUploadedDocs, setHasUploadedDocs] = useState(false);
-  // 用 ref 追踪当前是否已登录，避免在已退出时继续设置文档状态
-  const loggedInRef = useRef(false);
+  const [showProfile, setShowProfile] = useState(false);
 
-  /** 清空工作台状态并切换到未登录 */
-  function resetWorkspaceState() {
-    loggedInRef.current = false;
+  // 单调递增的 session generation，每轮登录递增，替代布尔值避免跨用户竞态
+  const sessionGenRef = useRef(0);
+  // 用于取消旧请求的 AbortController
+  const abortRef = useRef<AbortController | null>(null);
+
+  /** 清空工作台状态并递增 generation，取消所有正在进行的请求。
+   * 可传入成功消息以在登录页显示。*/
+  function resetWorkspaceState(successMessage?: string) {
+    sessionGenRef.current += 1;
+    // 取消旧请求
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
     const ws = blankWorkspace();
     setDocuments(ws.documents);
     setListLoading(ws.listLoading);
     setListError(ws.listError);
     setHasUploadedDocs(ws.hasUploadedDocs);
-    setPhase({ tag: "logged-out" });
+    setShowProfile(false);
+    setPhase({ tag: "logged-out", successMessage: successMessage ?? null });
   }
 
   // 401 统一回调：回到登录页并清空工作台
@@ -56,7 +68,7 @@ export default function App() {
   async function checkSession() {
     try {
       const user = await getMe();
-      loggedInRef.current = true;
+      sessionGenRef.current += 1;
       setPhase({ tag: "logged-in", user });
     } catch (err) {
       if (err instanceof Error && err.message.includes("401") ||
@@ -69,25 +81,34 @@ export default function App() {
   }
 
   async function loadDocuments() {
-    if (!loggedInRef.current) return;
+    // 发起时捕获当前 generation 并创建 AbortController
+    const gen = sessionGenRef.current;
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setListLoading(true);
     setListError(null);
     try {
       const docs = await listDocuments();
-      if (!loggedInRef.current) return;
+      // 校验 generation：必须是同一会话且未被取消
+      if (sessionGenRef.current !== gen || controller.signal.aborted) return;
       setDocuments(docs);
       setHasUploadedDocs(docs.length > 0);
     } catch (err) {
-      if (!loggedInRef.current) return;
+      if (sessionGenRef.current !== gen || controller.signal.aborted) return;
+      // AbortError 不视为错误
+      if (err instanceof DOMException && err.name === "AbortError") return;
       setListError(err instanceof Error ? err.message : "加载知识库失败");
     } finally {
-      if (loggedInRef.current) setListLoading(false);
+      if (sessionGenRef.current === gen && !controller.signal.aborted) {
+        setListLoading(false);
+      }
     }
   }
 
   // 登录成功
   function handleLoginSuccess(user: UserInfo) {
-    loggedInRef.current = true;
+    sessionGenRef.current += 1;
     setPhase({ tag: "logged-in", user });
   }
 
@@ -105,6 +126,18 @@ export default function App() {
       // 即使退出请求失败也清空本地状态
     }
     resetWorkspaceState();
+  }
+
+  /** 个人资料更新后刷新当前用户状态 */
+  function handleUserUpdate(updatedUser: UserInfo) {
+    setPhase((prev) =>
+      prev.tag === "logged-in" ? { ...prev, user: updatedUser } : prev,
+    );
+  }
+
+  /** 修改密码成功后立即执行完整清理，将成功消息带到登录页 */
+  function handlePasswordChanged(message: string) {
+    resetWorkspaceState(message);
   }
 
   // 登录后加载文档列表
@@ -126,7 +159,12 @@ export default function App() {
   }
 
   if (phase.tag === "logged-out") {
-    return <LoginPage onLoginSuccess={handleLoginSuccess} />;
+    return (
+      <LoginPage
+        onLoginSuccess={handleLoginSuccess}
+        successMessage={phase.successMessage ?? null}
+      />
+    );
   }
 
   if (phase.tag === "error") {
@@ -148,6 +186,8 @@ export default function App() {
 
   // ── 已登录工作台 ──
   const { user } = phase;
+  const displayLabel = user.display_name || user.username;
+  const avatarSrc = getAvatarUrl(user.avatar_url);
 
   return (
     <div className="app">
@@ -155,7 +195,23 @@ export default function App() {
         <h1>AI Learning</h1>
         <span className="app-subtitle">文档解读工作台</span>
         <div className="app-header-right">
-          <span className="app-user">👤 {user.username}</span>
+          <button
+            type="button"
+            className="app-user-button"
+            onClick={() => setShowProfile(true)}
+            title="个人设置"
+          >
+            <span className="app-user-avatar">
+              {avatarSrc ? (
+                <img src={avatarSrc} alt="" className="app-user-avatar-img" />
+              ) : (
+                <span className="app-user-avatar-placeholder">
+                  {displayLabel.charAt(0).toUpperCase()}
+                </span>
+              )}
+            </span>
+            <span className="app-user-name">{displayLabel}</span>
+          </button>
           <button
             type="button"
             className="app-logout-button"
@@ -165,6 +221,16 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {showProfile && (
+        <ProfileSettings
+          user={user}
+          onUserUpdate={handleUserUpdate}
+          onPasswordChanged={handlePasswordChanged}
+          onClose={() => setShowProfile(false)}
+        />
+      )}
+
       <main className="app-main">
         <aside className="app-sidebar">
           <UploadPanel

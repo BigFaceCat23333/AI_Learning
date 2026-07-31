@@ -69,6 +69,7 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Captcha-Id"],
     )
     app.include_router(auth_router, prefix="/api")
     app.include_router(router, prefix="/api")

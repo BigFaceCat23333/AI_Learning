@@ -87,12 +87,34 @@ export AI_LEARNING_EMBEDDING_MODEL="text-embedding-v4"
 - 用户名：`admin`
 - 密码：由部署者在生成 `AI_LEARNING_AUTH_SECRET` 时同步生成，详见下方部署步骤。
 
+### 现有部署增量升级（保留数据）
+
+> 适用场景：已有运行中的部署，需要增加验证码登录和用户资料功能，**不丢失**现有文档和上传文件。
+
+1. **备份数据库**：
+   ```bash
+   pg_dump -h localhost -p 5432 -U urpapa -d ai_learning > backup_$(date +%Y%m%d).sql
+   ```
+
+2. **执行增量迁移**（可重复安全执行）：
+   ```bash
+   psql -h localhost -p 5432 -U urpapa -d ai_learning -f sql/003_add_captcha_profile.sql
+   ```
+
+3. **头像持久化**：Docker 部署时，头像目录从 `AI_LEARNING_UPLOAD_DIR` 派生，位于 `${UPLOAD_DIR}/avatars/`。确保该目录在持久化卷中（默认 `backend_uploads` 卷已覆盖）。
+
+4. **重启容器**：
+   ```bash
+   docker compose up --build -d
+   ```
+
 ### 首次部署（全新数据库）
 
 1. 准备 PostgreSQL 数据库。
-2. 执行 `sql/initSqlTable.sql` 初始化所有表（含预置 admin 用户哈希）。
-3. 复制 `.env.example` → `.env`，填写 `AI_LEARNING_AUTH_SECRET` 及其他配置。
+2. 执行 `sql/initSqlTable.sql` 初始化所有表（含预置 admin 用户哈希和验证码表）。
+3. 复制 `.env.example` → `.env`，填写 `AI_LEARNING_AUTH_SECRET`（至少 32 字符）及其他配置。
 4. 启动后端和前端容器。
+5. 使用交付密码登录，建议首次登录后立即修改密码。
 
 ### 现有 Docker 部署重新初始化（含旧知识库）
 

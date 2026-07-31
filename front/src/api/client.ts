@@ -4,6 +4,8 @@ import type {
   DocumentUploadResponse,
   LoginRequest,
   OnUnauthorized,
+  PasswordChangeRequest,
+  ProfileUpdateRequest,
   QueryRequest,
   QueryResponse,
   UserInfo,
@@ -163,4 +165,97 @@ export async function downloadDocument(
   anchor.click();
   document.body.removeChild(anchor);
   URL.revokeObjectURL(url);
+}
+
+// ── 验证码与个人资料接口 ──
+
+/** 获取验证码图片，返回 { captchaId, blobUrl } */
+export async function fetchCaptcha(): Promise<{ captchaId: string; blobUrl: string }> {
+  const response = await apiFetch("/auth/captcha", {}, { notifyUnauthorized: false });
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
+
+  const captchaId = response.headers.get("X-Captcha-Id");
+  if (!captchaId) {
+    throw new Error("验证码响应缺少挑战 ID。");
+  }
+
+  const blob = await response.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  return { captchaId, blobUrl };
+}
+
+/** 更新个人资料 */
+export async function updateProfile(body: ProfileUpdateRequest): Promise<UserInfo> {
+  const response = await apiFetch("/auth/me/profile", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
+
+  return response.json() as Promise<UserInfo>;
+}
+
+/** 上传头像 */
+export async function uploadAvatar(file: File): Promise<UserInfo> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await apiFetch("/auth/me/avatar", {
+    method: "PUT",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
+
+  return response.json() as Promise<UserInfo>;
+}
+
+/** 删除头像 */
+export async function deleteAvatar(): Promise<UserInfo> {
+  const response = await apiFetch("/auth/me/avatar", {
+    method: "DELETE",
+  });
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
+
+  return response.json() as Promise<UserInfo>;
+}
+
+/** 构造头像完整 URL */
+export function getAvatarUrl(avatarUrl: string | null | undefined): string | null {
+  if (!avatarUrl) return null;
+  return `${BASE_URL}${avatarUrl}`;
+}
+
+/** 修改密码（当前密码错误不触发全局未授权回调） */
+export async function changePassword(body: PasswordChangeRequest): Promise<void> {
+  const response = await apiFetch(
+    "/auth/me/password",
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    { notifyUnauthorized: false },
+  );
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
 }

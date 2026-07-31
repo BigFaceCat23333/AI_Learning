@@ -47,12 +47,33 @@ export interface ApiError {
 export interface LoginRequest {
   username: string;
   password: string;
+  captcha_id: string;
+  captcha_code: string;
 }
 
 /** 登录/当前用户响应 */
 export interface UserInfo {
   user_id: number;
   username: string;
+  display_name: string | null;
+  email: string | null;
+  phone: string | null;
+  bio: string | null;
+  avatar_url: string | null;
+}
+
+/** 个人资料更新请求 */
+export interface ProfileUpdateRequest {
+  display_name: string | null;
+  email: string | null;
+  phone: string | null;
+  bio: string | null;
+}
+
+/** 密码修改请求 */
+export interface PasswordChangeRequest {
+  current_password: string;
+  new_password: string;
 }
 
 /** 401 未登录回调 */

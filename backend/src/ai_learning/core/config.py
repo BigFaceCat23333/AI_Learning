@@ -40,6 +40,17 @@ class Settings(BaseSettings):
     auth_cookie_secure: bool = False
     auth_cookie_name: str = "ai_learning_session"
 
+    # 验证码配置
+    captcha_ttl_seconds: int = 120
+    captcha_width: int = 200
+    captcha_height: int = 70
+    captcha_length: int = 4
+
+    # 头像配置
+    avatar_max_bytes: int = 2 * 1024 * 1024
+    avatar_max_pixels: int = 512
+    # 头像目录从 upload_dir 派生，不单独配置，保证 Docker 持久化一致
+
     model_config = SettingsConfigDict(
         env_prefix="AI_LEARNING_",
         env_file=".env",

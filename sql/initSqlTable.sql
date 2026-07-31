@@ -8,6 +8,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- 按外键依赖顺序清理旧表
 DROP TABLE IF EXISTS document_chunks;
 DROP TABLE IF EXISTS documents;
+DROP TABLE IF EXISTS captcha_challenges;
 DROP TABLE IF EXISTS users;
 
 -- 用户表
@@ -16,6 +17,11 @@ CREATE TABLE users (
     username VARCHAR(64) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    display_name VARCHAR(64),
+    email VARCHAR(254),
+    phone VARCHAR(32),
+    bio VARCHAR(500),
+    avatar_path VARCHAR(500),
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -52,6 +58,17 @@ CREATE INDEX idx_document_chunks_content_hash ON document_chunks(content_hash);
 
 -- 向量索引（HNSW，用于 cosine distance 高效召回）
 CREATE INDEX idx_document_chunks_embedding ON document_chunks USING hnsw (embedding vector_cosine_ops);
+
+-- 验证码挑战表
+CREATE TABLE captcha_challenges (
+    id VARCHAR(36) PRIMARY KEY,
+    answer_digest VARCHAR(64) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    consumed_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_captcha_challenges_expires_at ON captcha_challenges(expires_at);
 
 -- 预置 admin 用户（Argon2id 哈希，密码由部署时安全随机源生成）
 INSERT INTO users (username, password_hash, is_active)
