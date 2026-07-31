@@ -8,6 +8,8 @@ AGENTS_DIR="${PROJECT_ROOT}/.agents"
 TMUX_SESSION="${AGENT_TMUX_SESSION:-agents}"
 CONTROLLER_WINDOW="${AGENT_CONTROLLER_WINDOW:-controller}"
 CONTROLLER_TARGET="${TMUX_SESSION}:${CONTROLLER_WINDOW}"
+CLAUDE_PANE="${AGENT_CLAUDE_PANE:-agents:work.1}"
+CODEX_PANE="${AGENT_CODEX_PANE:-agents:work.0}"
 
 if [[ "$PROJECT_ROOT" != "$EXPECTED_PROJECT_ROOT" ]]; then
   echo "This project-level command must stay at ${EXPECTED_PROJECT_ROOT}." >&2
@@ -34,6 +36,7 @@ controller_exists() {
 
 start_controller() {
   local state
+  local controller_command
 
   mkdir -p "$AGENTS_DIR"
   touch "$AGENTS_DIR/PLAN.md" "$AGENTS_DIR/STATE" "$AGENTS_DIR/controller.log"
@@ -45,7 +48,15 @@ start_controller() {
     return 0
   fi
   if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    echo "未找到 tmux 会话 ${TMUX_SESSION}。请先启动 Codex 和 Claude 双面板。" >&2
+    echo "未找到 tmux 会话 ${TMUX_SESSION}。请先创建 Codex 和 Claude 可视化双面板。" >&2
+    exit 1
+  fi
+  if ! tmux display-message -p -t "$CODEX_PANE" '#{pane_id}' >/dev/null 2>&1; then
+    echo "未找到 Codex 面板 ${CODEX_PANE}。" >&2
+    exit 1
+  fi
+  if ! tmux display-message -p -t "$CLAUDE_PANE" '#{pane_id}' >/dev/null 2>&1; then
+    echo "未找到 Claude 面板 ${CLAUDE_PANE}。" >&2
     exit 1
   fi
   if [[ -z "$state" || "$state" == "idle" ]]; then
@@ -59,9 +70,10 @@ start_controller() {
     printf '\n[%s] starting controller\n' "$(date '+%Y-%m-%d %H:%M:%S')"
   } >> "$AGENTS_DIR/controller.log"
 
-  tmux new-window -d -t "${TMUX_SESSION}:" -n "$CONTROLLER_WINDOW" \
-    "cd '${PROJECT_ROOT}' && ./agent-loop.sh controller >> .agents/controller.log 2>&1"
+  controller_command="cd '${PROJECT_ROOT}' && ./agent-loop.sh controller >> .agents/controller.log 2>&1"
+  tmux new-window -d -t "${TMUX_SESSION}:" -n "$CONTROLLER_WINDOW" "$controller_command"
   echo "双 Agent 自动协作已在后台启动。"
+  echo "Claude 将在 ${CLAUDE_PANE} 可视化执行，Codex 将在 ${CODEX_PANE} 可视化审查。"
   echo "查看状态：./agent status"
 }
 
