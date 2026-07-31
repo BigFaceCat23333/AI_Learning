@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXPECTED_PROJECT_ROOT="/Users/urpapa/code/proj/pyProj/ai-learning"
+PROJECT_ROOT="$SCRIPT_DIR"
+AGENTS_DIR="${PROJECT_ROOT}/.agents"
+TMUX_SESSION="${AGENT_TMUX_SESSION:-agents}"
+CONTROLLER_WINDOW="${AGENT_CONTROLLER_WINDOW:-controller}"
+CONTROLLER_TARGET="${TMUX_SESSION}:${CONTROLLER_WINDOW}"
+
+if [[ "$PROJECT_ROOT" != "$EXPECTED_PROJECT_ROOT" ]]; then
+  echo "This project-level command must stay at ${EXPECTED_PROJECT_ROOT}." >&2
+  exit 1
+fi
+
+cd "$PROJECT_ROOT"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./agent          start or resume automatic collaboration
+  ./agent status   show the current state
+  ./agent stop     stop the background controller; state is preserved
+  ./agent logs     show recent controller logs
+  ./agent help     show this help
+EOF
+}
+
+controller_exists() {
+  tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null |
+    grep -Fqx "$CONTROLLER_WINDOW"
+}
+
+start_controller() {
+  local state
+
+  mkdir -p "$AGENTS_DIR"
+  touch "$AGENTS_DIR/PLAN.md" "$AGENTS_DIR/STATE" "$AGENTS_DIR/controller.log"
+  state="$(sed -n '1p' "$AGENTS_DIR/STATE")"
+
+  if controller_exists; then
+    echo "双 Agent 后台控制器已经在运行。"
+    "$PROJECT_ROOT/agent-loop.sh" status
+    return 0
+  fi
+  if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo "未找到 tmux 会话 ${TMUX_SESSION}。请先启动 Codex 和 Claude 双面板。" >&2
+    exit 1
+  fi
+  if [[ -z "$state" || "$state" == "idle" ]]; then
+    if [[ ! -s "$AGENTS_DIR/PLAN.md" ]]; then
+      echo "还没有 .agents/PLAN.md。请先让 Codex 生成实现计划。" >&2
+      exit 1
+    fi
+  fi
+
+  {
+    printf '\n[%s] starting controller\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  } >> "$AGENTS_DIR/controller.log"
+
+  tmux new-window -d -t "${TMUX_SESSION}:" -n "$CONTROLLER_WINDOW" \
+    "cd '${PROJECT_ROOT}' && ./agent-loop.sh controller >> .agents/controller.log 2>&1"
+  echo "双 Agent 自动协作已在后台启动。"
+  echo "查看状态：./agent status"
+}
+
+show_status() {
+  if controller_exists; then
+    echo "后台控制器：运行中 (${CONTROLLER_TARGET})"
+  else
+    echo "后台控制器：未运行"
+  fi
+  "$PROJECT_ROOT/agent-loop.sh" status
+}
+
+stop_controller() {
+  if controller_exists; then
+    tmux kill-window -t "$CONTROLLER_TARGET"
+    echo "后台控制器已停止，当前协作状态已保留；再次运行 ./agent 可继续。"
+  else
+    echo "后台控制器当前没有运行。"
+  fi
+}
+
+show_logs() {
+  if [[ -s "$AGENTS_DIR/controller.log" ]]; then
+    tail -n "${AGENT_LOG_LINES:-100}" "$AGENTS_DIR/controller.log"
+  else
+    echo "还没有控制器日志。"
+  fi
+}
+
+case "${1:-start}" in
+  start|run|resume)
+    start_controller
+    ;;
+  status)
+    show_status
+    ;;
+  stop)
+    stop_controller
+    ;;
+  logs|log)
+    show_logs
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    usage
+    exit 1
+    ;;
+esac

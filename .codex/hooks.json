@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.agents/hooks/agent-stop.sh\" codex",
+            "timeout": 30,
+            "statusMessage": "校验 Codex 项目级协作结果"
+          }
+        ]
+      }
+    ]
+  }
+}
