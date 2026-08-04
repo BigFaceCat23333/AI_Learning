@@ -45,7 +45,7 @@ CREATE TABLE document_chunks (
     document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     chunk_text TEXT NOT NULL,
-    embedding vector(1536) NOT NULL,
+    embedding vector(1024) NOT NULL,
     chunk_metadata JSONB NOT NULL,
     content_hash VARCHAR(64) NOT NULL,
     char_count INTEGER NOT NULL,

@@ -94,21 +94,80 @@ export async function getMe(): Promise<UserInfo> {
 /** 上传文档到后端 */
 export async function uploadDocument(
   file: File,
+  onProgress?: (progress: { phase: "uploading" | "processing"; percent: number }) => void,
+  options?: { uploadId: string; signal: AbortSignal },
 ): Promise<DocumentUploadResponse> {
-  const formData = new FormData();
-  formData.append("file", file);
+  return new Promise((resolve, reject) => {
+    const formData = new FormData();
+    formData.append("file", file);
 
-  const response = await apiFetch("/documents/upload", {
-    method: "POST",
-    body: formData,
+    // fetch 暂不提供上传字节进度，使用 XMLHttpRequest 获取真实传输百分比。
+    const request = new XMLHttpRequest();
+    request.open("POST", `${BASE_URL}/documents/upload`);
+    request.withCredentials = true;
+    if (options?.uploadId) request.setRequestHeader("X-Upload-Id", options.uploadId);
+
+    const abortRequest = () => request.abort();
+    const cleanup = () => options?.signal.removeEventListener("abort", abortRequest);
+    if (options?.signal.aborted) {
+      reject(new Error("上传已取消。"));
+      return;
+    }
+    options?.signal.addEventListener("abort", abortRequest, { once: true });
+
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      const percent = Math.min(100, Math.round((event.loaded / event.total) * 100));
+      onProgress?.({ phase: "uploading", percent });
+    };
+    request.upload.onload = () => {
+      onProgress?.({ phase: "processing", percent: 100 });
+    };
+
+    request.onload = () => {
+      cleanup();
+      if (request.status === 401 && onUnauthorized) onUnauthorized();
+
+      let body: DocumentUploadResponse | ApiError | null = null;
+      try {
+        body = JSON.parse(request.responseText) as DocumentUploadResponse | ApiError;
+      } catch {
+        // 非 JSON 响应由下面的 HTTP 状态兜底提示处理。
+      }
+
+      if (request.status >= 200 && request.status < 300 && body) {
+        resolve(body as DocumentUploadResponse);
+        return;
+      }
+
+      const detail = body && "detail" in body
+        ? body.detail
+        : `请求失败 (HTTP ${request.status})`;
+      reject(new Error(detail));
+    };
+    request.onerror = () => {
+      cleanup();
+      reject(new Error("网络连接失败，请稍后重试。"));
+    };
+    request.onabort = () => {
+      cleanup();
+      reject(new Error("上传已取消。"));
+    };
+
+    onProgress?.({ phase: "uploading", percent: 0 });
+    request.send(formData);
   });
+}
 
+/** 通知后端停止指定文档的解析和后续 Embedding 批次。 */
+export async function cancelDocumentUpload(uploadId: string): Promise<void> {
+  const response = await apiFetch(`/documents/upload/${encodeURIComponent(uploadId)}`, {
+    method: "DELETE",
+  });
   if (!response.ok) {
     const detail = await extractDetail(response);
     throw new Error(detail);
   }
-
-  return response.json() as Promise<DocumentUploadResponse>;
 }
 
 /** 向后端提交问题，获取解读结果 */

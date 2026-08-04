@@ -7,7 +7,7 @@ import tempfile
 from io import BytesIO
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, Response as FastAPIResponse
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy.orm import Session, selectinload
@@ -42,9 +42,14 @@ from ai_learning.core.config import get_settings
 from ai_learning.core.llm_client import LLMClient
 from ai_learning.db import get_db
 from ai_learning.models import Document, DocumentChunk, User
-from ai_learning.rag.embedder import EmbeddingServiceError, get_embedding_client
+from ai_learning.rag.embedder import (
+    EmbeddingCancelledError,
+    EmbeddingServiceError,
+    get_embedding_client,
+)
 from ai_learning.rag.retriever import retrieve
 from ai_learning.services import save_uploaded_document
+from ai_learning.upload_control import finish_upload, register_upload, request_upload_cancel
 
 logger = logging.getLogger(__name__)
 
@@ -395,15 +400,30 @@ def change_password(
 @router.post("/documents/upload", response_model=DocumentUploadResponse)
 def upload_document(
     file: UploadFile,
+    x_upload_id: str | None = Header(default=None, alias="X-Upload-Id"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> DocumentUploadResponse:
+    if x_upload_id is not None and len(x_upload_id) > 64:
+        raise HTTPException(status_code=400, detail="上传标识无效。")
+
+    cancel_event = register_upload(user.id, x_upload_id) if x_upload_id else None
     try:
-        document = save_uploaded_document(file, db, user_id=user.id)
+        document = save_uploaded_document(
+            file,
+            db,
+            user_id=user.id,
+            should_cancel=cancel_event.is_set if cancel_event is not None else None,
+        )
+    except EmbeddingCancelledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except EmbeddingServiceError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        if x_upload_id:
+            finish_upload(user.id, x_upload_id)
 
     return DocumentUploadResponse(
         document_id=document.id,
@@ -411,6 +431,17 @@ def upload_document(
         file_type=document.file_type,
         chunk_count=len(document.chunks),
     )
+
+
+@router.delete("/documents/upload/{upload_id}", status_code=204)
+def cancel_document_upload(
+    upload_id: str,
+    user: User = Depends(get_current_user),
+) -> None:
+    """幂等取消当前用户的文档上传或向量处理任务。"""
+    if not upload_id or len(upload_id) > 64:
+        raise HTTPException(status_code=400, detail="上传标识无效。")
+    request_upload_cancel(user.id, upload_id)
 
 
 @router.post("/query", response_model=QueryResponse)

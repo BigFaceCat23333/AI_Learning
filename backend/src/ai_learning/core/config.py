@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     embedding_provider: str = "openai_compatible"
     embedding_base_url: str = ""
     embedding_api_key: Optional[str] = None
-    embedding_model: str = "text-embedding-v4"
-    embedding_dimensions: int = 1536
+    embedding_model: str = "text-embedding-v3"
+    embedding_dimensions: int = 1024
 
     # 检索配置
     retrieval_min_score: float = 0.35

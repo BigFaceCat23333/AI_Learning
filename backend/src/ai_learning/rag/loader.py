@@ -27,10 +27,20 @@ def validate_document_filename(filename: str) -> str:
 
 
 def parse_text_file(content: bytes) -> str:
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Only UTF-8 encoded documents are supported.") from exc
+    # 优先使用 UTF-8（同时去除可选 BOM），兼容常见中文 GBK/GB18030 文本文档。
+    text = None
+    last_error = None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            text = content.decode(encoding)
+            break
+        except UnicodeDecodeError as exc:
+            last_error = exc
+
+    if text is None:
+        raise ValueError(
+            "Only UTF-8 or GB18030 encoded documents are supported."
+        ) from last_error
 
     normalized = text.strip()
     if not normalized:

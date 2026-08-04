@@ -9,12 +9,16 @@ import hashlib
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 import httpx
 
 from ai_learning.core.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+# DashScope/OpenAI 兼容接口对单次 input 数量有限制，使用保守批次兼容大文档。
+_EMBEDDING_BATCH_SIZE = 10
 
 
 class EmbeddingServiceError(Exception):
@@ -24,11 +28,19 @@ class EmbeddingServiceError(Exception):
     """
 
 
+class EmbeddingCancelledError(Exception):
+    """文档上传被用户取消，停止后续 Embedding 批次。"""
+
+
 class EmbeddingClient(ABC):
     """Embedding 客户端抽象接口。"""
 
     @abstractmethod
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts(
+        self,
+        texts: list[str],
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[list[float]]:
         """对多个文本生成 embedding。"""
 
     @abstractmethod
@@ -51,7 +63,11 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         self._settings = settings
         self._url = f"{settings.embedding_base_url.rstrip('/')}/embeddings"
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts(
+        self,
+        texts: list[str],
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[list[float]]:
         if not texts:
             return []
         settings = self._settings
@@ -66,55 +82,76 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
                 len(texts),
                 settings.embedding_dimensions,
             )
-        try:
-            response = httpx.post(
-                url,
-                headers={"Authorization": f"Bearer {settings.embedding_api_key}"},
-                json={
-                    "model": settings.embedding_model,
-                    "input": texts,
-                    "dimensions": settings.embedding_dimensions,
-                },
-                timeout=60,
-            )
-            response.raise_for_status()
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-        except httpx.HTTPStatusError as exc:
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-            if settings.rag_debug_logs:
-                logger.warning(
-                    "Embedding 调用失败 | status_code=%d elapsed_ms=%d",
-                    exc.response.status_code,
-                    elapsed_ms,
-                )
-            raise
-        except httpx.HTTPError:
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-            if settings.rag_debug_logs:
-                logger.warning(
-                    "Embedding 调用失败 | error_type=network elapsed_ms=%d",
-                    elapsed_ms,
-                )
-            raise
-        payload = response.json()
-        data = payload["data"]
-        if len(data) != len(texts):
-            raise ValueError(
-                f"Embedding API returned {len(data)} vectors, expected {len(texts)}."
-            )
         vectors: list[list[float]] = []
-        for item in data:
-            vec = item["embedding"]
-            if len(vec) != settings.embedding_dimensions:
-                raise ValueError(
-                    f"Embedding dimension mismatch: expected {settings.embedding_dimensions}, "
-                    f"got {len(vec)}."
+        batch_count = (len(texts) + _EMBEDDING_BATCH_SIZE - 1) // _EMBEDDING_BATCH_SIZE
+        for batch_index, offset in enumerate(
+            range(0, len(texts), _EMBEDDING_BATCH_SIZE),
+            start=1,
+        ):
+            if should_cancel is not None and should_cancel():
+                raise EmbeddingCancelledError("文档上传已取消。")
+            batch = texts[offset : offset + _EMBEDDING_BATCH_SIZE]
+            try:
+                response = httpx.post(
+                    url,
+                    headers={"Authorization": f"Bearer {settings.embedding_api_key}"},
+                    json={
+                        "model": settings.embedding_model,
+                        "input": batch,
+                        "dimensions": settings.embedding_dimensions,
+                    },
+                    timeout=60,
                 )
-            vectors.append(vec)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                if settings.rag_debug_logs:
+                    logger.warning(
+                        "Embedding 调用失败 | status_code=%d batch=%d/%d elapsed_ms=%d",
+                        exc.response.status_code,
+                        batch_index,
+                        batch_count,
+                        elapsed_ms,
+                    )
+                raise
+            except httpx.HTTPError:
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                if settings.rag_debug_logs:
+                    logger.warning(
+                        "Embedding 调用失败 | error_type=network batch=%d/%d elapsed_ms=%d",
+                        batch_index,
+                        batch_count,
+                        elapsed_ms,
+                    )
+                raise
+
+            if should_cancel is not None and should_cancel():
+                raise EmbeddingCancelledError("文档上传已取消。")
+            data = response.json()["data"]
+            if len(data) != len(batch):
+                raise ValueError(
+                    f"Embedding API returned {len(data)} vectors, expected {len(batch)} "
+                    f"in batch {batch_index}/{batch_count}."
+                )
+            # OpenAI 兼容响应通过 index 标识输入顺序；缺少 index 时保持响应原顺序。
+            if all("index" in item for item in data):
+                data = sorted(data, key=lambda item: item["index"])
+            for item in data:
+                vec = item["embedding"]
+                if len(vec) != settings.embedding_dimensions:
+                    raise ValueError(
+                        f"Embedding dimension mismatch: expected {settings.embedding_dimensions}, "
+                        f"got {len(vec)}."
+                    )
+                vectors.append(vec)
+
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
         if settings.rag_debug_logs:
             logger.info(
-                "Embedding 调用成功 | vector_count=%d first_vector_dim=%d elapsed_ms=%d",
+                "Embedding 调用成功 | vector_count=%d batch_count=%d "
+                "first_vector_dim=%d elapsed_ms=%d",
                 len(vectors),
+                batch_count,
                 len(vectors[0]),
                 elapsed_ms,
             )
@@ -152,7 +189,13 @@ class MockEmbeddingClient(EmbeddingClient):
             vec = [v / norm for v in vec]
         return vec
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts(
+        self,
+        texts: list[str],
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[list[float]]:
+        if should_cancel is not None and should_cancel():
+            raise EmbeddingCancelledError("文档上传已取消。")
         return [self._hash_vector(text) for text in texts]
 
     def embed_query(self, query: str) -> list[float]:

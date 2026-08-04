@@ -8,6 +8,7 @@ from ai_learning.core.config import Settings, get_settings
 from ai_learning.db import Base, get_engine, get_session_factory
 from ai_learning.models import Document, DocumentChunk, User
 from ai_learning.rag.embedder import (
+    EmbeddingCancelledError,
     EmbeddingServiceError,
     MockEmbeddingClient,
     OpenAICompatibleEmbeddingClient,
@@ -20,6 +21,7 @@ from ai_learning.rag.loader import (
     validate_document_filename,
 )
 from ai_learning.rag.retriever import retrieve
+from ai_learning.upload_control import finish_upload, register_upload, request_upload_cancel
 
 POSTGRES_TEST_DATABASE_URL = (
     "postgresql+psycopg://urpapa:postgres@localhost:5432/ai_learning_test"
@@ -47,7 +49,7 @@ def db_session(monkeypatch, tmp_path) -> Generator:
         os.getenv("AI_LEARNING_TEST_DATABASE_URL", POSTGRES_TEST_DATABASE_URL),
     )
     monkeypatch.setenv("AI_LEARNING_EMBEDDING_PROVIDER", "mock")
-    monkeypatch.setenv("AI_LEARNING_EMBEDDING_DIMENSIONS", "1536")
+    monkeypatch.setenv("AI_LEARNING_EMBEDDING_DIMENSIONS", "1024")
     monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
     monkeypatch.setenv("AI_LEARNING_RETRIEVAL_TOP_K", "5")
     monkeypatch.setenv("AI_LEARNING_RETRIEVAL_CANDIDATE_K", "20")
@@ -104,6 +106,22 @@ def test_parse_text_file_rejects_empty_content() -> None:
         assert "empty" in str(exc)
     else:
         raise AssertionError("Expected empty file to fail")
+
+
+def test_parse_text_file_supports_utf8_bom() -> None:
+    """UTF-8 BOM 不应出现在解析后的正文中。"""
+    assert parse_text_file("兽王".encode("utf-8-sig")) == "兽王"
+
+
+def test_parse_text_file_supports_gb18030() -> None:
+    """兼容 Windows 中文 TXT 常见的 GBK/GB18030 编码。"""
+    text = "兽王\r\n作者：雨魔"
+    assert parse_text_file(text.encode("gb18030")) == text
+
+
+def test_parse_text_file_rejects_unknown_encoding() -> None:
+    with pytest.raises(ValueError, match="UTF-8 or GB18030"):
+        parse_text_file(b"\xff\xff")
 
 
 def test_split_chunks_uses_overlap() -> None:
@@ -232,7 +250,7 @@ def test_openai_compatible_sends_dimensions(monkeypatch) -> None:
             return {
                 "data": [
                     {
-                        "embedding": [0.1] * 1536,
+                        "embedding": [0.1] * 1024,
                     }
                 ]
             }
@@ -249,8 +267,8 @@ def test_openai_compatible_sends_dimensions(monkeypatch) -> None:
         embedding_provider="openai_compatible",
         embedding_base_url="https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         embedding_api_key="test-key",
-        embedding_model="text-embedding-v4",
-        embedding_dimensions=1536,
+        embedding_model="text-embedding-v3",
+        embedding_dimensions=1024,
     )
 
     client = OpenAICompatibleEmbeddingClient(settings)
@@ -259,10 +277,96 @@ def test_openai_compatible_sends_dimensions(monkeypatch) -> None:
     assert len(vectors) == 1
     assert captured["url"].endswith("/compatible-mode/v1/embeddings")
     assert captured["json"] == {
-        "model": "text-embedding-v4",
+        "model": "text-embedding-v3",
         "input": ["hello"],
-        "dimensions": 1536,
+        "dimensions": 1024,
     }
+
+
+def test_openai_compatible_batches_large_input_in_order(monkeypatch) -> None:
+    """大文档分批请求 Embedding，并按输入顺序合并向量。"""
+    captured_batches: list[list[str]] = []
+
+    class FakeResponse:
+        def __init__(self, inputs: list[str]) -> None:
+            self._inputs = inputs
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "data": [
+                    {
+                        "index": index,
+                        "embedding": [float(text.removeprefix("text-"))] * 4,
+                    }
+                    for index, text in reversed(list(enumerate(self._inputs)))
+                ]
+            }
+
+    def fake_post(url: str, headers: dict, json: dict, timeout: int) -> FakeResponse:
+        batch = list(json["input"])
+        captured_batches.append(batch)
+        return FakeResponse(batch)
+
+    monkeypatch.setattr("ai_learning.rag.embedder.httpx.post", fake_post)
+    settings = Settings(
+        embedding_provider="openai_compatible",
+        embedding_base_url="https://api.example.com/v1",
+        embedding_api_key="test-key",
+        embedding_dimensions=4,
+    )
+
+    texts = [f"text-{index}" for index in range(23)]
+    vectors = OpenAICompatibleEmbeddingClient(settings).embed_texts(texts)
+
+    assert [len(batch) for batch in captured_batches] == [10, 10, 3]
+    assert [vector[0] for vector in vectors] == [float(index) for index in range(23)]
+
+
+def test_openai_compatible_stops_after_cancel(monkeypatch) -> None:
+    """取消后不再调用后续 Embedding 批次。"""
+    captured_batches: list[list[str]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": [{"embedding": [0.1] * 4} for _ in range(10)]}
+
+    def fake_post(url: str, headers: dict, json: dict, timeout: int) -> FakeResponse:
+        captured_batches.append(list(json["input"]))
+        return FakeResponse()
+
+    monkeypatch.setattr("ai_learning.rag.embedder.httpx.post", fake_post)
+    settings = Settings(
+        embedding_provider="openai_compatible",
+        embedding_base_url="https://api.example.com/v1",
+        embedding_api_key="test-key",
+        embedding_dimensions=4,
+    )
+
+    with pytest.raises(EmbeddingCancelledError, match="已取消"):
+        OpenAICompatibleEmbeddingClient(settings).embed_texts(
+            [f"text-{index}" for index in range(20)],
+            should_cancel=lambda: len(captured_batches) >= 1,
+        )
+
+    assert len(captured_batches) == 1
+
+
+def test_upload_cancel_can_arrive_before_upload_registration() -> None:
+    """文件仍在传输时发出的取消标记，应由随后开始的后端处理读取。"""
+    upload_id = "cancel-before-register"
+    request_upload_cancel(1, upload_id)
+    try:
+        assert register_upload(1, upload_id).is_set()
+        assert not register_upload(2, upload_id).is_set()
+    finally:
+        finish_upload(1, upload_id)
+        finish_upload(2, upload_id)
 
 
 # ── retriever 测试 ──

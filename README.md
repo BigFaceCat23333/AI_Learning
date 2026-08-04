@@ -55,7 +55,8 @@ curl http://localhost:8000/api/health
 export AI_LEARNING_LLM_API_KEY="你的 LLM API Key"
 export AI_LEARNING_EMBEDDING_API_KEY="你的阿里云百炼 API Key"
 export AI_LEARNING_EMBEDDING_BASE_URL="https://your-workspace-id.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
-export AI_LEARNING_EMBEDDING_MODEL="text-embedding-v4"
+export AI_LEARNING_EMBEDDING_MODEL="text-embedding-v3"
+export AI_LEARNING_EMBEDDING_DIMENSIONS="1024"
 ```
 
 ## 环境变量说明
@@ -69,8 +70,8 @@ export AI_LEARNING_EMBEDDING_MODEL="text-embedding-v4"
 | `AI_LEARNING_EMBEDDING_PROVIDER` | Embedding 提供者 (`openai_compatible` 或 `mock`) | `openai_compatible` |
 | `AI_LEARNING_EMBEDDING_BASE_URL` | 阿里云百炼 OpenAI 兼容 Embedding API 地址（需包含 `/compatible-mode/v1`） | - |
 | `AI_LEARNING_EMBEDDING_API_KEY` | 阿里云百炼 API Key | - |
-| `AI_LEARNING_EMBEDDING_MODEL` | Embedding 模型名 | `text-embedding-v4` |
-| `AI_LEARNING_EMBEDDING_DIMENSIONS` | 向量维度 | `1536` |
+| `AI_LEARNING_EMBEDDING_MODEL` | Embedding 模型名 | `text-embedding-v3` |
+| `AI_LEARNING_EMBEDDING_DIMENSIONS` | 向量维度 | `1024` |
 | `AI_LEARNING_RETRIEVAL_MIN_SCORE` | 检索最低相关度阈值 | `0.35` |
 | `AI_LEARNING_RETRIEVAL_TOP_K` | 返回结果数 | `5` |
 | `AI_LEARNING_RETRIEVAL_CANDIDATE_K` | 候选召回数 | `20` |
@@ -260,7 +261,8 @@ AI_LEARNING_DATABASE_URL=postgresql+psycopg://urpapa:postgres@host.docker.intern
 AI_LEARNING_LLM_API_KEY=你的 API Key
 AI_LEARNING_EMBEDDING_API_KEY=你的阿里云百炼 API Key
 AI_LEARNING_EMBEDDING_BASE_URL=https://your-workspace-id.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
-AI_LEARNING_EMBEDDING_MODEL=text-embedding-v4
+AI_LEARNING_EMBEDDING_MODEL=text-embedding-v3
+AI_LEARNING_EMBEDDING_DIMENSIONS=1024
 ```
 
 其中 `your-workspace-id` 需要替换为阿里云百炼业务空间 ID；如果使用新加坡地域，按百炼控制台提供的地域域名替换整个 `AI_LEARNING_EMBEDDING_BASE_URL`。
