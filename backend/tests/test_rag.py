@@ -1,5 +1,6 @@
 import os
 from collections.abc import Generator
+from datetime import datetime
 
 import pytest
 from sqlalchemy import text
@@ -739,6 +740,55 @@ def test_retrieve_user_id_isolation(db_session) -> None:
     for r in results2:
         assert r.chunk.document.user_id == u2.id
         assert r.chunk.document.filename != "u1.md"
+
+
+def test_retrieve_excludes_soft_deleted_documents(db_session) -> None:
+    """逻辑删除文档的分片即使仍在数据库中，也不能参与向量召回。"""
+    settings = get_settings()
+    embedder = MockEmbeddingClient(settings)
+    user_id = db_session.query(User).first().id
+    query = "soft deleted unique content"
+
+    deleted_doc = Document(
+        user_id=user_id,
+        filename="deleted.md",
+        file_type="md",
+        saved_path="/tmp/deleted.md",
+        raw_text=query,
+        deleted_at=datetime.utcnow(),
+    )
+    deleted_doc.chunks = [
+        _make_chunk(deleted_doc, 0, query, embedder.embed_query(query)),
+    ]
+    active_doc = Document(
+        user_id=user_id,
+        filename="active.md",
+        file_type="md",
+        saved_path="/tmp/active.md",
+        raw_text="active fallback content",
+    )
+    active_doc.chunks = [
+        _make_chunk(
+            active_doc,
+            0,
+            "active fallback content",
+            embedder.embed_query("active fallback content"),
+        ),
+    ]
+    db_session.add_all([deleted_doc, active_doc])
+    db_session.commit()
+
+    results = retrieve(
+        query=query,
+        db=db_session,
+        embedder=embedder,
+        user_id=user_id,
+        top_k=10,
+        min_score=-1.0,
+    )
+
+    assert results
+    assert all(result.chunk.document.filename != "deleted.md" for result in results)
 
 
 def test_embedding_log_includes_status_code_on_http_error(monkeypatch, caplog) -> None:

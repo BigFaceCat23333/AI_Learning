@@ -34,10 +34,12 @@ CREATE TABLE documents (
     file_type VARCHAR(20) NOT NULL,
     saved_path VARCHAR(500) NOT NULL,
     raw_text TEXT NOT NULL,
+    deleted_at TIMESTAMP NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_documents_user_id ON documents(user_id);
+CREATE INDEX idx_documents_user_deleted_at ON documents(user_id, deleted_at);
 
 -- 文档分块表
 CREATE TABLE document_chunks (

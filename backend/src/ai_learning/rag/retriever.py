@@ -69,6 +69,8 @@ def retrieve(
         )
         .join(Document, DocumentChunk.document_id == Document.id)
         .options(joinedload(DocumentChunk.document))
+        # 逻辑删除的文档必须从所有向量检索结果中排除。
+        .filter(Document.deleted_at.is_(None))
     )
     # 用户隔离：按 user_id 过滤（必须在 limit/order 之前）
     if user_id is not None:

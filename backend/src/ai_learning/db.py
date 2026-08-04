@@ -23,10 +23,9 @@ def get_session_factory():
 
 
 def init_db() -> None:
-    """初始化数据库：启用 pgvector 扩展并创建所有表。
+    """初始化数据库：启用 pgvector 扩展、创建表并执行轻量兼容升级。
 
-    注意：Base.metadata.create_all() 不会迁移已有旧表。
-    开发环境如需重建表，请使用 sql/initSqlTable.sql。
+    注意：这里只执行本项目明确维护的幂等兼容 SQL；其他结构变更仍需正式迁移。
     """
     from ai_learning import models  # noqa: F401
 
@@ -34,6 +33,17 @@ def init_db() -> None:
     with engine.begin() as connection:
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(bind=engine)
+    # 兼容已存在的 documents 表，确保旧环境无需删库即可使用文档逻辑删除。
+    with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP NULL")
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_documents_user_deleted_at "
+                "ON documents(user_id, deleted_at)"
+            )
+        )
 
 
 def get_db() -> Generator[Session, None, None]:

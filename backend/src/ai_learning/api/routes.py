@@ -4,6 +4,7 @@ import os
 import re
 import secrets
 import tempfile
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
@@ -463,7 +464,7 @@ def query(
     chunk_count = (
         db.query(DocumentChunk)
         .join(Document, DocumentChunk.document_id == Document.id)
-        .filter(Document.user_id == user.id)
+        .filter(Document.user_id == user.id, Document.deleted_at.is_(None))
         .count()
     )
     if chunk_count == 0:
@@ -569,7 +570,7 @@ def list_documents(
     documents = (
         db.query(Document)
         .options(selectinload(Document.chunks))
-        .filter(Document.user_id == user.id)
+        .filter(Document.user_id == user.id, Document.deleted_at.is_(None))
         .order_by(Document.created_at.desc(), Document.id.desc())
         .all()
     )
@@ -584,6 +585,31 @@ def list_documents(
         )
         for doc in documents
     ]
+
+
+@router.delete("/documents/{document_id}", status_code=204)
+def delete_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    """逻辑删除当前用户的文档，并保留原文件和分片数据。"""
+    # 同时校验用户归属和未删除状态，避免泄露其他用户或历史文档是否存在。
+    document = (
+        db.query(Document)
+        .filter(
+            Document.id == document_id,
+            Document.user_id == user.id,
+            Document.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    # 只写删除时间，不移除数据库记录、分片或磁盘原文件。
+    document.deleted_at = datetime.utcnow()
+    db.commit()
 
 
 # 文件类型到 MIME 的映射
@@ -605,7 +631,11 @@ def download_document(
     # 同时按文档 ID 和当前 user_id 查询，避免资源存在性泄露
     document = (
         db.query(Document)
-        .filter(Document.id == document_id, Document.user_id == user.id)
+        .filter(
+            Document.id == document_id,
+            Document.user_id == user.id,
+            Document.deleted_at.is_(None),
+        )
         .first()
     )
     if document is None:

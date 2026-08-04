@@ -39,6 +39,7 @@ class Document(Base):
     file_type: Mapped[str] = mapped_column(String(20), nullable=False)
     saved_path: Mapped[str] = mapped_column(String(500), nullable=False)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     user: Mapped[User] = relationship(back_populates="documents")

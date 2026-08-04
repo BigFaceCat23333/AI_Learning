@@ -1,6 +1,6 @@
-import { type ChangeEvent, type DragEvent, useState, useRef } from "react";
+import { type ChangeEvent, type DragEvent, useEffect, useState, useRef } from "react";
 import type { DocumentListItem, DocumentUploadResponse } from "../types/api";
-import { downloadDocument, uploadDocument } from "../api/client";
+import { cancelDocumentUpload, deleteDocument, downloadDocument, uploadDocument } from "../api/client";
 
 const ALLOWED_TYPES = [".txt", ".md"];
 const MAX_SIZE = 5 * 1024 * 1024; // 5MB
@@ -11,6 +11,7 @@ interface UploadPanelProps {
   listLoading: boolean;
   listError: string | null;
   onRetry: () => void;
+  onDeleteSuccess: (documentId: number) => void;
 }
 
 /** 格式化 ISO 时间为本地可读字符串 */
@@ -35,14 +36,40 @@ export default function UploadPanel({
   listLoading,
   listError,
   onRetry,
+  onDeleteSuccess,
 }: UploadPanelProps) {
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadPhase, setUploadPhase] = useState<"uploading" | "processing" | null>(null);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadFilename, setUploadFilename] = useState("");
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelNotice, setCancelNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DocumentUploadResponse | null>(null);
   const [downloadingIds, setDownloadingIds] = useState<Set<number>>(new Set());
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<DocumentListItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const deleteConfirmRef = useRef<HTMLButtonElement>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
+  const uploadIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!deleteTarget) return;
+
+    deleteConfirmRef.current?.focus();
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape" && !deleting) {
+        setDeleteTarget(null);
+        setDeleteError(null);
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [deleteTarget, deleting]);
 
   function validateFile(file: File): string | null {
     const name = file.name.toLowerCase();
@@ -60,6 +87,7 @@ export default function UploadPanel({
   async function handleFile(file: File) {
     setError(null);
     setResult(null);
+    setCancelNotice(null);
 
     const validationError = validateFile(file);
     if (validationError) {
@@ -68,14 +96,50 @@ export default function UploadPanel({
     }
 
     setUploading(true);
+    setUploadPhase("uploading");
+    setUploadProgress(0);
+    setUploadFilename(file.name);
+    const uploadId = crypto.randomUUID();
+    const controller = new AbortController();
+    uploadIdRef.current = uploadId;
+    uploadAbortRef.current = controller;
     try {
-      const data = await uploadDocument(file);
+      const data = await uploadDocument(file, ({ phase, percent }) => {
+        setUploadPhase(phase);
+        setUploadProgress(percent);
+      }, { uploadId, signal: controller.signal });
       setResult(data);
       onUploadSuccess();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "上传失败");
+      if (controller.signal.aborted) {
+        setCancelNotice("上传已取消，文档不会入库。");
+      } else {
+        setError(err instanceof Error ? err.message : "上传失败");
+      }
     } finally {
       setUploading(false);
+      setUploadPhase(null);
+      setCancelling(false);
+      if (uploadIdRef.current === uploadId) {
+        uploadIdRef.current = null;
+        uploadAbortRef.current = null;
+      }
+    }
+  }
+
+  async function handleCancelUpload() {
+    const uploadId = uploadIdRef.current;
+    const controller = uploadAbortRef.current;
+    if (!uploadId || !controller || cancelling) return;
+
+    setCancelling(true);
+    setError(null);
+    try {
+      await cancelDocumentUpload(uploadId);
+      controller.abort();
+    } catch (err) {
+      setError(err instanceof Error ? `取消失败：${err.message}` : "取消失败，请重试。");
+      setCancelling(false);
     }
   }
 
@@ -125,6 +189,33 @@ export default function UploadPanel({
     }
   }
 
+  function requestDelete(doc: DocumentListItem) {
+    setDeleteTarget(doc);
+    setDeleteError(null);
+  }
+
+  function closeDeleteDialog() {
+    if (deleting) return;
+    setDeleteTarget(null);
+    setDeleteError(null);
+  }
+
+  async function confirmDelete() {
+    if (!deleteTarget || deleting) return;
+
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteDocument(deleteTarget.document_id);
+      onDeleteSuccess(deleteTarget.document_id);
+      setDeleteTarget(null);
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "删除失败，请重试。");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   return (
     <div className="upload-panel">
       <h3 className="panel-title">📄 文档上传</h3>
@@ -145,7 +236,7 @@ export default function UploadPanel({
           disabled={uploading}
         />
         {uploading ? (
-          <p className="upload-hint">⏳ 正在上传...</p>
+          <p className="upload-hint">⏳ 正在处理 {uploadFilename}</p>
         ) : (
           <p className="upload-hint">
             拖拽文件到此处，或点击选择文件
@@ -154,6 +245,47 @@ export default function UploadPanel({
           </p>
         )}
       </div>
+
+      {uploading && uploadPhase && (
+        <div className="upload-progress-panel" aria-live="polite">
+          <div className="upload-progress-header">
+            <span>
+              {uploadPhase === "uploading"
+                ? "正在上传文件"
+                : "文件已上传，正在解析、分块并生成向量"}
+            </span>
+            <div className="upload-progress-actions">
+              {uploadPhase === "uploading" && <strong>{uploadProgress}%</strong>}
+              <button
+                type="button"
+                className="upload-cancel-button"
+                onClick={handleCancelUpload}
+                disabled={cancelling}
+              >
+                {cancelling ? "取消中..." : "取消上传"}
+              </button>
+            </div>
+          </div>
+          <div
+            className={`upload-progress-track ${uploadPhase === "processing" ? "processing" : ""}`}
+            role="progressbar"
+            aria-label={uploadPhase === "uploading" ? "文件上传进度" : "文档处理进度"}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={uploadPhase === "uploading" ? uploadProgress : undefined}
+          >
+            <div
+              className="upload-progress-bar"
+              style={{ width: uploadPhase === "uploading" ? `${uploadProgress}%` : "35%" }}
+            />
+          </div>
+          {uploadPhase === "processing" && (
+            <p className="upload-progress-note">大文件生成向量可能需要数分钟，请勿关闭页面或重复上传。</p>
+          )}
+        </div>
+      )}
+
+      {cancelNotice && <div className="upload-cancel-notice">{cancelNotice}</div>}
 
       {error && (
         <div className="upload-error">
@@ -218,15 +350,26 @@ export default function UploadPanel({
                       </span>
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    className="doc-download-button"
-                    disabled={isDownloading}
-                    onClick={() => handleDownload(doc)}
-                    title={isDownloading ? "下载中..." : "下载原文件"}
-                  >
-                    {isDownloading ? "⏳" : "⬇"}
-                  </button>
+                  <div className="doc-item-actions">
+                    <button
+                      type="button"
+                      className="doc-delete-button"
+                      onClick={() => requestDelete(doc)}
+                      title={`删除 ${doc.filename}`}
+                      aria-label={`删除文档 ${doc.filename}`}
+                    >
+                      🗑
+                    </button>
+                    <button
+                      type="button"
+                      className="doc-download-button"
+                      disabled={isDownloading}
+                      onClick={() => handleDownload(doc)}
+                      title={isDownloading ? "下载中..." : "下载原文件"}
+                    >
+                      {isDownloading ? "⏳" : "⬇"}
+                    </button>
+                  </div>
                 </li>
               );
             })}
@@ -237,6 +380,48 @@ export default function UploadPanel({
           <div className="doc-download-error">❌ {downloadError}</div>
         )}
       </div>
+
+      {deleteTarget && (
+        <div
+          className="modal-overlay"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeDeleteDialog();
+          }}
+        >
+          <div
+            className="delete-confirm-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-confirm-title"
+            aria-describedby="delete-confirm-description"
+          >
+            <h2 id="delete-confirm-title">确认删除文档？</h2>
+            <p id="delete-confirm-description">
+              删除后，文档“{deleteTarget.filename}”将不再显示，也不会继续参与 AI 问答。
+            </p>
+            {deleteError && <div className="delete-confirm-error">❌ {deleteError}</div>}
+            <div className="delete-confirm-actions">
+              <button
+                type="button"
+                className="profile-button-secondary"
+                onClick={closeDeleteDialog}
+                disabled={deleting}
+              >
+                取消
+              </button>
+              <button
+                ref={deleteConfirmRef}
+                type="button"
+                className="delete-confirm-button"
+                onClick={confirmDelete}
+                disabled={deleting}
+              >
+                {deleting ? "删除中..." : "确认删除"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

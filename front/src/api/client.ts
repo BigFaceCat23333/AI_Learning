@@ -203,6 +203,18 @@ export async function listDocuments(): Promise<DocumentListItem[]> {
   return response.json() as Promise<DocumentListItem[]>;
 }
 
+/** 逻辑删除当前用户的文档 */
+export async function deleteDocument(documentId: number): Promise<void> {
+  const response = await apiFetch(`/documents/${documentId}`, {
+    method: "DELETE",
+  });
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
+}
+
 /** 下载文档原文件，通过 Blob 和临时对象 URL 触发浏览器下载 */
 export async function downloadDocument(
   documentId: number,

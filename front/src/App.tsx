@@ -118,6 +118,15 @@ export default function App() {
     loadDocuments();
   }
 
+  // 文档逻辑删除成功后立即同步列表和对话可用状态。
+  function handleDocumentDeleted(documentId: number) {
+    const remainingDocuments = documents.filter(
+      (document) => document.document_id !== documentId,
+    );
+    setDocuments(remainingDocuments);
+    setHasUploadedDocs(remainingDocuments.length > 0);
+  }
+
   // 退出登录：清空工作台并回到登录页
   async function handleLogout() {
     try {
@@ -239,6 +248,7 @@ export default function App() {
             listLoading={listLoading}
             listError={listError}
             onRetry={loadDocuments}
+            onDeleteSuccess={handleDocumentDeleted}
           />
         </aside>
         <section className="app-content">

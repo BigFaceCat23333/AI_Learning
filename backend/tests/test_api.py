@@ -332,6 +332,12 @@ def test_download_without_login_returns_401(client: TestClient) -> None:
     assert response.status_code == 401
 
 
+def test_delete_without_login_returns_401(client: TestClient) -> None:
+    response = client.delete("/api/documents/1")
+
+    assert response.status_code == 401
+
+
 def test_agent_without_login_returns_401(client: TestClient) -> None:
     response = client.post("/api/agent", json={"task": "test"})
 
@@ -639,6 +645,88 @@ def test_download_nonexistent_document_returns_404(client: TestClient) -> None:
 
     assert response.status_code == 404
     assert "not found" in response.json()["detail"].lower()
+
+
+def test_delete_document_soft_deletes_and_hides_it(client: TestClient) -> None:
+    """逻辑删除后保留底层数据和文件，但列表、下载及问答均不可再使用。"""
+    from pathlib import Path
+    from ai_learning import models as _models
+
+    _login(client)
+    upload_response = client.post(
+        "/api/documents/upload",
+        files={"file": ("obsolete.txt", "即将逻辑删除的内容。".encode("utf-8"), "text/plain")},
+    )
+    assert upload_response.status_code == 200
+    document_id = upload_response.json()["document_id"]
+
+    session = get_session_factory()()
+    try:
+        document = session.query(_models.Document).filter(_models.Document.id == document_id).one()
+        saved_path = Path(document.saved_path)
+        chunk_count = session.query(_models.DocumentChunk).filter(
+            _models.DocumentChunk.document_id == document_id,
+        ).count()
+    finally:
+        session.close()
+
+    response = client.delete(f"/api/documents/{document_id}")
+    assert response.status_code == 204
+    assert response.content == b""
+
+    session = get_session_factory()()
+    try:
+        document = session.query(_models.Document).filter(_models.Document.id == document_id).one()
+        assert document.deleted_at is not None
+        assert session.query(_models.DocumentChunk).filter(
+            _models.DocumentChunk.document_id == document_id,
+        ).count() == chunk_count
+    finally:
+        session.close()
+    assert saved_path.is_file()
+
+    assert client.get("/api/documents").json() == []
+    assert client.get(f"/api/documents/{document_id}/download").status_code == 404
+    query_response = client.post("/api/query", json={"question": "删除后的内容是什么？"})
+    assert query_response.status_code == 404
+    assert query_response.json()["detail"] == "No documents have been uploaded."
+
+    assert client.delete(f"/api/documents/{document_id}").status_code == 404
+
+
+def test_user_cannot_delete_other_user_document(client: TestClient) -> None:
+    """删除接口不能泄露或修改其他用户的文档。"""
+    from ai_learning import models as _models
+
+    _login(client)
+    upload_response = client.post(
+        "/api/documents/upload",
+        files={"file": ("owner.txt", "仅所有者可删除。".encode("utf-8"), "text/plain")},
+    )
+    document_id = upload_response.json()["document_id"]
+    client.post("/api/auth/logout")
+
+    session = get_session_factory()()
+    try:
+        user2 = _models.User(
+            username="delete-user2",
+            password_hash=hash_password("password2"),
+            is_active=True,
+        )
+        session.add(user2)
+        session.commit()
+    finally:
+        session.close()
+
+    _login(client, "delete-user2", "password2")
+    assert client.delete(f"/api/documents/{document_id}").status_code == 404
+
+    session = get_session_factory()()
+    try:
+        document = session.query(_models.Document).filter(_models.Document.id == document_id).one()
+        assert document.deleted_at is None
+    finally:
+        session.close()
 
 
 def test_download_missing_file_returns_404(client: TestClient) -> None:
