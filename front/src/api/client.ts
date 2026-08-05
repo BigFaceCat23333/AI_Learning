@@ -1,5 +1,8 @@
 import type {
   ApiError,
+  ConversationDetail,
+  ConversationListResponse,
+  ConversationSummary,
   DocumentListItem,
   DocumentUploadResponse,
   LoginRequest,
@@ -174,8 +177,13 @@ export async function cancelDocumentUpload(uploadId: string): Promise<void> {
 export async function queryDocument(
   question: string,
   topK: number = 3,
+  conversationId?: number,
 ): Promise<QueryResponse> {
-  const body: QueryRequest = { question, top_k: topK };
+  const body: QueryRequest = {
+    question,
+    top_k: topK,
+    ...(conversationId != null ? { conversation_id: conversationId } : {}),
+  };
 
   const response = await apiFetch("/query", {
     method: "POST",
@@ -324,6 +332,72 @@ export async function changePassword(body: PasswordChangeRequest): Promise<void>
     },
     { notifyUnauthorized: false },
   );
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
+}
+
+// ── 会话接口 ──
+
+/** 获取分页历史会话列表 */
+export async function listConversations(
+  offset: number = 0,
+  limit: number = 20,
+): Promise<ConversationListResponse> {
+  const params = new URLSearchParams({
+    offset: String(offset),
+    limit: String(limit),
+  });
+  const response = await apiFetch(`/conversations?${params}`);
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
+
+  return response.json() as Promise<ConversationListResponse>;
+}
+
+/** 获取会话详情（含全部消息） */
+export async function getConversation(
+  conversationId: number,
+): Promise<ConversationDetail> {
+  const response = await apiFetch(`/conversations/${conversationId}`);
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
+
+  return response.json() as Promise<ConversationDetail>;
+}
+
+/** 重命名会话 */
+export async function renameConversation(
+  conversationId: number,
+  title: string,
+): Promise<ConversationSummary> {
+  const response = await apiFetch(`/conversations/${conversationId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+
+  if (!response.ok) {
+    const detail = await extractDetail(response);
+    throw new Error(detail);
+  }
+
+  return response.json() as Promise<ConversationSummary>;
+}
+
+/** 软删除会话 */
+export async function deleteConversation(conversationId: number): Promise<void> {
+  const response = await apiFetch(`/conversations/${conversationId}`, {
+    method: "DELETE",
+  });
 
   if (!response.ok) {
     const detail = await extractDetail(response);

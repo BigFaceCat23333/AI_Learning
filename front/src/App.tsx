@@ -241,6 +241,9 @@ export default function App() {
       )}
 
       <main className="app-main">
+        <section className="app-content">
+          <ChatPanel hasDocuments={hasUploadedDocs} />
+        </section>
         <aside className="app-sidebar">
           <UploadPanel
             onUploadSuccess={handleUploadSuccess}
@@ -251,9 +254,6 @@ export default function App() {
             onDeleteSuccess={handleDocumentDeleted}
           />
         </aside>
-        <section className="app-content">
-          <ChatPanel hasDocuments={hasUploadedDocs} />
-        </section>
       </main>
     </div>
   );

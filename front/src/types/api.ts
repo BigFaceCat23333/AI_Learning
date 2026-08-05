@@ -10,6 +10,7 @@ export interface DocumentUploadResponse {
 export interface QueryRequest {
   question: string;
   top_k: number;
+  conversation_id?: number;
 }
 
 export interface QuerySource {
@@ -27,6 +28,8 @@ export interface QueryResponse {
   question: string;
   answer: string;
   sources: QuerySource[];
+  conversation_id?: number | null;
+  conversation_title?: string | null;
 }
 
 /** 历史文档列表项 */
@@ -78,3 +81,37 @@ export interface PasswordChangeRequest {
 
 /** 401 未登录回调 */
 export type OnUnauthorized = () => void;
+
+// ── 会话相关 ──
+
+/** 会话列表摘要 */
+export interface ConversationSummary {
+  id: number;
+  title: string;
+  created_at: string;
+  last_message_at: string;
+}
+
+/** 分页会话列表响应 */
+export interface ConversationListResponse {
+  items: ConversationSummary[];
+  total: number;
+}
+
+/** 持久化会话消息 */
+export interface ConversationMessage {
+  id: number;
+  role: string;
+  content: string;
+  sources: QuerySource[] | null;
+  created_at: string;
+}
+
+/** 会话详情（元信息 + 全部消息） */
+export interface ConversationDetail {
+  id: number;
+  title: string;
+  created_at: string;
+  last_message_at: string;
+  messages: ConversationMessage[];
+}
