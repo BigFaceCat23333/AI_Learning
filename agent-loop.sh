@@ -130,6 +130,27 @@ clear_run_diagnostics() {
   : > "$AGENTS_DIR/LAST_ERROR"
 }
 
+initialize_agent_output() {
+  local agent_kind="$1"
+
+  case "$agent_kind" in
+    claude)
+      : > "$AGENTS_DIR/CLAUDE_RESULT.md"
+      : > "$AGENTS_DIR/CLAUDE_STARTED"
+      : > "$AGENTS_DIR/CLAUDE_RESULT.done"
+      ;;
+    codex)
+      : > "$AGENTS_DIR/CODEX_REVIEW.md"
+      : > "$AGENTS_DIR/CODEX_STARTED"
+      : > "$AGENTS_DIR/CODEX_REVIEW.done"
+      ;;
+    *)
+      echo "Unknown agent kind: ${agent_kind}" >&2
+      return 1
+      ;;
+  esac
+}
+
 current_token() {
   local run_id
   local round
@@ -180,12 +201,8 @@ begin_run() {
   run_id="$(date +%Y%m%d-%H%M%S)-$$"
   write_single_line "$AGENTS_DIR/RUN_ID" "$run_id"
   write_single_line "$AGENTS_DIR/ROUND" "1"
-  : > "$AGENTS_DIR/CLAUDE_RESULT.md"
-  : > "$AGENTS_DIR/CODEX_REVIEW.md"
-  : > "$AGENTS_DIR/CLAUDE_STARTED"
-  : > "$AGENTS_DIR/CODEX_STARTED"
-  : > "$AGENTS_DIR/CLAUDE_RESULT.done"
-  : > "$AGENTS_DIR/CODEX_REVIEW.done"
+  initialize_agent_output "claude"
+  initialize_agent_output "codex"
   clear_run_diagnostics
   write_single_line "$AGENTS_DIR/LAST_STATUS" "RUNNING"
   set_state "claude_working"
@@ -208,11 +225,9 @@ prepare_revision_round() {
 
   round="$(read_single_line "$AGENTS_DIR/ROUND")"
   write_single_line "$AGENTS_DIR/ROUND" "$((round + 1))"
-  : > "$AGENTS_DIR/CLAUDE_RESULT.md"
-  : > "$AGENTS_DIR/CLAUDE_STARTED"
-  : > "$AGENTS_DIR/CLAUDE_RESULT.done"
-  : > "$AGENTS_DIR/CODEX_STARTED"
-  : > "$AGENTS_DIR/CODEX_REVIEW.done"
+  # 保留上一轮 CODEX_REVIEW.md，供 Claude 在修正轮次中读取；
+  # Claude 完成后、下一轮 Codex 审查开始前再初始化 Codex 输出。
+  initialize_agent_output "claude"
   clear_run_diagnostics
   write_single_line "$AGENTS_DIR/LAST_STATUS" "RUNNING"
   set_state "claude_working"
@@ -520,6 +535,7 @@ controller_loop() {
         notify_controller "Claude 已完成当前轮次，准备在 Codex 面板启动审查。"
         ;;
       claude_result_ready)
+        initialize_agent_output "codex"
         set_state "codex_reviewing"
         ;;
       codex_reviewing)
