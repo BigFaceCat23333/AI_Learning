@@ -44,6 +44,57 @@ def init_db() -> None:
                 "ON documents(user_id, deleted_at)"
             )
         )
+    # 兼容旧环境：增量创建会话相关表与索引。
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS conversations ("
+                "  id SERIAL PRIMARY KEY,"
+                "  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+                "  title VARCHAR(100) NOT NULL,"
+                "  created_at TIMESTAMP NOT NULL DEFAULT NOW(),"
+                "  last_message_at TIMESTAMP NOT NULL DEFAULT NOW(),"
+                "  deleted_at TIMESTAMP NULL"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_conversations_user_list "
+                "ON conversations(user_id, last_message_at DESC, id DESC)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS conversation_messages ("
+                "  id SERIAL PRIMARY KEY,"
+                "  conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,"
+                "  role VARCHAR(16) NOT NULL,"
+                "  content TEXT NOT NULL,"
+                "  sources JSONB NULL,"
+                "  created_at TIMESTAMP NOT NULL DEFAULT NOW()"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv "
+                "ON conversation_messages(conversation_id)"
+            )
+        )
+        # role CHECK 约束：幂等添加（PostgreSQL 不支持 ADD CONSTRAINT IF NOT EXISTS，
+        # 需要用 DO 块捕获 duplicate_object 错误）。
+        connection.execute(
+            text(
+                "DO $$ "
+                "BEGIN "
+                "  ALTER TABLE conversation_messages "
+                "    ADD CONSTRAINT chk_conversation_messages_role "
+                "    CHECK (role IN ('user', 'assistant')); "
+                "EXCEPTION WHEN duplicate_object THEN NULL; "
+                "END $$"
+            )
+        )
 
 
 def get_db() -> Generator[Session, None, None]:

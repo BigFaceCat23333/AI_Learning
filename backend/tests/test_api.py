@@ -27,6 +27,8 @@ def recreate_tables() -> None:
     engine = get_engine()
     with engine.begin() as connection:
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        connection.execute(text("DROP TABLE IF EXISTS conversation_messages CASCADE"))
+        connection.execute(text("DROP TABLE IF EXISTS conversations CASCADE"))
         connection.execute(text("DROP TABLE IF EXISTS document_chunks CASCADE"))
         connection.execute(text("DROP TABLE IF EXISTS documents CASCADE"))
         connection.execute(text("DROP TABLE IF EXISTS captcha_challenges CASCADE"))
@@ -39,7 +41,7 @@ def recreate_tables() -> None:
 def clear_database() -> None:
     engine = get_engine()
     with engine.begin() as connection:
-        connection.execute(text("TRUNCATE TABLE document_chunks, documents, captcha_challenges, users RESTART IDENTITY CASCADE"))
+        connection.execute(text("TRUNCATE TABLE conversation_messages, conversations, document_chunks, documents, captcha_challenges, users RESTART IDENTITY CASCADE"))
 
 
 def _create_test_user(username: str = "admin") -> int:
@@ -1728,3 +1730,538 @@ def test_captcha_concurrent_single_consumption(client: TestClient) -> None:
     success_count = sum(1 for r in results if r == 200)
     assert success_count <= 1, f"Expected at most 1 success, got: {results}"
     assert 400 in results, f"Expected one 400, got: {results}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ── 会话接口鉴权测试 ──
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_list_conversations_without_login_returns_401(client: TestClient) -> None:
+    response = client.get("/api/conversations")
+    assert response.status_code == 401
+
+
+def test_get_conversation_without_login_returns_401(client: TestClient) -> None:
+    response = client.get("/api/conversations/1")
+    assert response.status_code == 401
+
+
+def test_rename_conversation_without_login_returns_401(client: TestClient) -> None:
+    response = client.patch("/api/conversations/1", json={"title": "test"})
+    assert response.status_code == 401
+
+
+def test_delete_conversation_without_login_returns_401(client: TestClient) -> None:
+    response = client.delete("/api/conversations/1")
+    assert response.status_code == 401
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ── 会话功能测试 ──
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_query_creates_conversation_and_returns_id(client: TestClient, monkeypatch) -> None:
+    """不传 conversation_id 时查询创建新会话，返回 ID 和标题。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "测试回答")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("demo.txt", "FastAPI 是一个用于构建 API 的现代 Python Web 框架，支持异步处理和自动文档生成。".encode("utf-8"), "text/plain")},
+    )
+
+    response = client.post("/api/query", json={"question": "FastAPI是什么", "top_k": 1})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["conversation_id"] is not None
+    assert payload["conversation_title"] == "FastAPI是什么"
+    assert payload["answer"] == "测试回答"
+
+
+def test_query_with_conversation_id_appends_messages(client: TestClient, monkeypatch) -> None:
+    """带合法 conversation_id 追加消息，更新 last_message_at 并正确排序。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "第一条回答")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("doc.txt", "内容A，关于数据库优化。".encode("utf-8"), "text/plain")},
+    )
+
+    # 第一条消息
+    r1 = client.post("/api/query", json={"question": "第一个问题", "top_k": 1})
+    assert r1.status_code == 200
+    conv_id = r1.json()["conversation_id"]
+
+    # 第二条消息带 conversation_id
+    r2 = client.post(
+        "/api/query",
+        json={"question": "第二个问题", "top_k": 1, "conversation_id": conv_id},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["conversation_id"] == conv_id
+
+    # 验证列表排序：最后一条在前
+    list_resp = client.get("/api/conversations")
+    assert list_resp.status_code == 200
+    items = list_resp.json()["items"]
+    assert len(items) == 1
+    assert items[0]["id"] == conv_id
+    assert items[0]["last_message_at"] >= items[0]["created_at"]
+
+
+def test_query_low_relevance_persists_conversation(client: TestClient, monkeypatch) -> None:
+    """低相关度拒答也正常持久化会话和消息。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "should not be called")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "1.1")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("note.txt", "今天天气很好。".encode("utf-8"), "text/plain")},
+    )
+
+    response = client.post(
+        "/api/query",
+        json={"question": "如何配置数据库连接池？", "top_k": 5},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sources"] == []
+    assert "没有找到足够依据" in payload["answer"]
+    assert payload["conversation_id"] is not None
+    assert payload["conversation_title"] == "如何配置数据库连接池？"
+
+    # 确认列表中有该会话
+    list_resp = client.get("/api/conversations")
+    assert list_resp.status_code == 200
+    assert list_resp.json()["total"] == 1
+
+
+def test_query_llm_error_does_not_create_conversation(client: TestClient, monkeypatch) -> None:
+    """Embedding/LLM 异常不产生新会话或半条消息。"""
+    _login(client)
+    monkeypatch.setenv("AI_LEARNING_LLM_API_KEY", "")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("demo.txt", "FastAPI 支持上传文档并解析入库，用户可以通过 API 上传 txt 和 md 文件。".encode("utf-8"), "text/plain")},
+    )
+
+    response = client.post("/api/query", json={"question": "文档怎么入库？", "top_k": 1})
+    assert response.status_code == 503
+
+    # 确认没有创建会话
+    list_resp = client.get("/api/conversations")
+    assert list_resp.status_code == 200
+    assert list_resp.json()["items"] == []
+
+
+def test_conversation_title_truncated_to_30_chars(client: TestClient, monkeypatch) -> None:
+    """首问超过 30 字符时标题截取前 30 个字符。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "answer")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("doc.txt", "FastAPI框架支持异步处理。".encode("utf-8"), "text/plain")},
+    )
+
+    long_q = "这是一个非常非常非常长的问题用来测试标题截取功能是否正常工作"
+    response = client.post("/api/query", json={"question": long_q, "top_k": 1})
+    assert response.status_code == 200
+    title = response.json()["conversation_title"]
+    assert len(title) == 30
+    assert title == long_q[:30]
+
+
+def test_conversation_list_pagination(client: TestClient, monkeypatch) -> None:
+    """列表按最后消息时间倒序，offset/limit/total 和软删除过滤正确。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "answer")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("doc.txt", "FastAPI 是一个现代 Python Web 框架，支持异步处理和自动生成 API 文档。".encode("utf-8"), "text/plain")},
+    )
+
+    # 创建 3 个会话
+    for i in range(3):
+        client.post("/api/query", json={"question": f"FastAPI问题{i}", "top_k": 1})
+
+    # 分页：limit=2
+    r1 = client.get("/api/conversations?offset=0&limit=2")
+    assert r1.status_code == 200
+    p1 = r1.json()
+    assert len(p1["items"]) == 2
+    assert p1["total"] == 3
+
+    r2 = client.get("/api/conversations?offset=2&limit=2")
+    assert r2.status_code == 200
+    p2 = r2.json()
+    assert len(p2["items"]) == 1
+
+    # 软删除一个后 total 减少
+    conv_id = p1["items"][0]["id"]
+    client.delete(f"/api/conversations/{conv_id}")
+    r3 = client.get("/api/conversations")
+    assert r3.json()["total"] == 2
+
+
+def test_conversation_limit_validation(client: TestClient) -> None:
+    """limit 超出范围返回 400。"""
+    _login(client)
+    assert client.get("/api/conversations?limit=0").status_code == 400
+    assert client.get("/api/conversations?limit=101").status_code == 400
+
+
+def test_conversation_detail_returns_all_messages(client: TestClient, monkeypatch) -> None:
+    """详情按 created_at 正序返回全部消息及来源快照。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "回答")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("doc.txt", "FastAPI 是一个用于构建 API 的现代 Python Web 框架，支持异步处理和自动生成交互式文档。".encode("utf-8"), "text/plain")},
+    )
+
+    # 创建会话并追加多条消息
+    r1 = client.post("/api/query", json={"question": "FastAPI是什么框架", "top_k": 1})
+    conv_id = r1.json()["conversation_id"]
+    client.post("/api/query", json={"question": "它支持什么功能", "top_k": 1, "conversation_id": conv_id})
+
+    # 详情
+    detail = client.get(f"/api/conversations/{conv_id}")
+    assert detail.status_code == 200
+    d = detail.json()
+    assert d["id"] == conv_id
+    assert len(d["messages"]) == 4  # user + assistant × 2
+    # 消息按 created_at 正序
+    roles = [m["role"] for m in d["messages"]]
+    assert roles == ["user", "assistant", "user", "assistant"]
+    assert d["messages"][1]["sources"] is not None  # 来源快照
+
+
+def test_conversation_detail_returns_sources_snapshot_after_doc_deleted(
+    client: TestClient, monkeypatch,
+) -> None:
+    """文档软删除后，历史消息中的来源快照仍能读取。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "回答内容")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("guide.txt", "这是一份会被删除的指南文档。".encode("utf-8"), "text/plain")},
+    )
+
+    r1 = client.post("/api/query", json={"question": "指南是什么", "top_k": 1})
+    conv_id = r1.json()["conversation_id"]
+
+    # 软删除文档
+    client.delete("/api/documents/1")
+
+    # 历史消息的来源快照仍存在
+    detail = client.get(f"/api/conversations/{conv_id}")
+    assert detail.status_code == 200
+    msg = detail.json()["messages"][1]  # assistant 消息
+    assert msg["sources"] is not None
+    assert len(msg["sources"]) >= 1
+    assert msg["sources"][0]["filename"] == "guide.txt"
+
+
+def test_rename_conversation(client: TestClient, monkeypatch) -> None:
+    """改名成功：trim、空标题拒绝、超长标题拒绝。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "answer")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("doc.txt", "FastAPI框架支持异步处理。".encode("utf-8"), "text/plain")},
+    )
+    r1 = client.post("/api/query", json={"question": "orig", "top_k": 1})
+    conv_id = r1.json()["conversation_id"]
+
+    # 正常改名（trim 空格）
+    r2 = client.patch(f"/api/conversations/{conv_id}", json={"title": "  新标题  "})
+    assert r2.status_code == 200
+    assert r2.json()["title"] == "新标题"
+
+    # 空标题拒绝（Pydantic validator 转 422）
+    r3 = client.patch(f"/api/conversations/{conv_id}", json={"title": "   "})
+    assert r3.status_code == 422
+
+    # 超长标题拒绝（422）
+    r4 = client.patch(f"/api/conversations/{conv_id}", json={"title": "x" * 101})
+    assert r4.status_code == 422
+
+    # 确认持久化
+    detail = client.get(f"/api/conversations/{conv_id}")
+    assert detail.json()["title"] == "新标题"
+
+
+def test_delete_conversation_soft_deletes(client: TestClient, monkeypatch) -> None:
+    """删除当前会话设置 deleted_at，列表和详情不可见。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "answer")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("doc.txt", "FastAPI框架支持异步处理。".encode("utf-8"), "text/plain")},
+    )
+    r1 = client.post("/api/query", json={"question": "测试", "top_k": 1})
+    conv_id = r1.json()["conversation_id"]
+
+    # 删除
+    assert client.delete(f"/api/conversations/{conv_id}").status_code == 204
+
+    # 列表不可见
+    assert client.get("/api/conversations").json()["items"] == []
+
+    # 详情 404
+    assert client.get(f"/api/conversations/{conv_id}").status_code == 404
+
+    # 不能对已删除会话继续提问
+    assert client.post(
+        "/api/query",
+        json={"question": "新问题", "top_k": 1, "conversation_id": conv_id},
+    ).status_code == 404
+
+
+def test_user_cannot_access_other_user_conversation(client: TestClient, monkeypatch) -> None:
+    """两个用户互相不能列表、读取、续聊、改名或删除对方会话，均返回 404。"""
+    from ai_learning import models as _models
+
+    _login(client, "admin", "test-password")
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "answer")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("admin_doc.txt", "FastAPI 是 admin 使用的 Python Web 框架，支持异步处理。".encode("utf-8"), "text/plain")},
+    )
+    r1 = client.post("/api/query", json={"question": "admin的问题", "top_k": 1})
+    conv_id = r1.json()["conversation_id"]
+    client.post("/api/auth/logout")
+
+    # 创建 user2
+    session = get_session_factory()()
+    try:
+        user2 = _models.User(
+            username="conv-user2",
+            password_hash=hash_password("password2"),
+            is_active=True,
+        )
+        session.add(user2)
+        session.commit()
+    finally:
+        session.close()
+
+    _login(client, "conv-user2", "password2")
+    # user2 上传自己的文档
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("user2_doc.txt", "React 是 user2 使用的前端框架，用于构建用户界面。".encode("utf-8"), "text/plain")},
+    )
+
+    # 所有操作都返回 404
+    assert client.get(f"/api/conversations/{conv_id}").status_code == 404
+    assert client.patch(f"/api/conversations/{conv_id}", json={"title": "hack"}).status_code == 404
+    assert client.delete(f"/api/conversations/{conv_id}").status_code == 404
+    assert client.post(
+        "/api/query",
+        json={"question": "hack", "conversation_id": conv_id},
+    ).status_code == 404
+
+    # user2 的列表不包含 admin 的会话
+    list_resp = client.get("/api/conversations")
+    assert list_resp.status_code == 200
+    for item in list_resp.json()["items"]:
+        assert item["id"] != conv_id
+
+
+def test_conversation_detail_nonexistent_returns_404(client: TestClient) -> None:
+    """不存在的会话 ID 返回 404。"""
+    _login(client)
+    assert client.get("/api/conversations/99999").status_code == 404
+
+
+def test_rename_nonexistent_conversation_returns_404(client: TestClient) -> None:
+    """改名不存在的会话返回 404。"""
+    _login(client)
+    assert client.patch("/api/conversations/99999", json={"title": "x"}).status_code == 404
+
+
+def test_delete_nonexistent_conversation_returns_404(client: TestClient) -> None:
+    """删除不存在的会话返回 404。"""
+    _login(client)
+    assert client.delete("/api/conversations/99999").status_code == 404
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ── 输入校验与边界测试 ──
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_query_rejects_whitespace_only_question(client: TestClient) -> None:
+    """纯空白问题被 Pydantic validator 拒绝（422）。"""
+    _login(client)
+    response = client.post("/api/query", json={"question": "   ", "top_k": 1})
+    assert response.status_code == 422
+
+
+def test_query_trims_whitespace_question(client: TestClient, monkeypatch) -> None:
+    """前后空格被 trim，标题不含空白。"""
+    _login(client)
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "answer")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("doc.txt", "FastAPI 是一个用于构建 API 的现代 Python Web 框架。".encode("utf-8"), "text/plain")},
+    )
+
+    response = client.post("/api/query", json={"question": "  什么是FastAPI  ", "top_k": 1})
+    assert response.status_code == 200
+    assert response.json()["question"] == "什么是FastAPI"
+    assert response.json()["conversation_title"] == "什么是FastAPI"
+
+
+def test_conversations_offset_negative_rejected(client: TestClient) -> None:
+    """offset 为负数返回 400。"""
+    _login(client)
+    assert client.get("/api/conversations?offset=-1").status_code == 400
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ── 历史窗口测试（检索 3 条用户问题 + 提示词 20 条消息） ──
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_history_search_window_uses_last_3_user_questions(
+    client: TestClient, monkeypatch,
+) -> None:
+    """检索文本包含最近 3 条用户问题 + 当前问题。"""
+    _login(client)
+
+    captured_search_texts: list[str] = []
+
+    from ai_learning.rag.retriever import retrieve as real_retrieve
+
+    def _capture_retrieve(*args, **kwargs):
+        captured_search_texts.append(kwargs.get("query", args[0] if args else ""))
+        return real_retrieve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "ai_learning.api.routes.retrieve", _capture_retrieve,
+    )
+    monkeypatch.setattr(LLMClient, "complete", lambda self, prompt: "answer")
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "0.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("doc.txt", "FastAPI 是一个现代 Python Web 框架，支持异步处理和自动生成 API 文档。".encode("utf-8"), "text/plain")},
+    )
+
+    # 创建 4 轮对话
+    questions = ["问题一", "问题二", "问题三", "问题四"]
+    conv_id: int | None = None
+    for q in questions:
+        resp = client.post(
+            "/api/query",
+            json={
+                "question": q,
+                "top_k": 1,
+                **({"conversation_id": conv_id} if conv_id is not None else {}),
+            },
+        )
+        assert resp.status_code == 200
+        if conv_id is None:
+            conv_id = resp.json()["conversation_id"]
+
+    # 第 5 个问题——检索文本应只包含最近 3 条 + 当前
+    client.post(
+        "/api/query",
+        json={"question": "问题五", "top_k": 1, "conversation_id": conv_id},
+    )
+
+    # 最后的检索文本
+    last_search = captured_search_texts[-1]
+    # 应包含"问题三"、"问题四"、"问题五"——最近 3 条用户问题 + 当前
+    assert "问题三" in last_search
+    assert "问题四" in last_search
+    assert "问题五" in last_search
+    # 不应包含最早的问题一——已超出 3 条窗口
+    assert "问题一" not in last_search
+
+
+def test_history_prompt_window_uses_last_20_messages(
+    client: TestClient, monkeypatch,
+) -> None:
+    """提示词包含最近 20 条消息（10 轮），不串入更旧消息。"""
+    _login(client)
+
+    captured_prompts: list[str] = []
+
+    def _capture_complete(self, prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return "answer"
+
+    monkeypatch.setattr(LLMClient, "complete", _capture_complete)
+    monkeypatch.setenv("AI_LEARNING_RETRIEVAL_MIN_SCORE", "-2.0")
+    get_settings.cache_clear()
+
+    client.post(
+        "/api/documents/upload",
+        files={"file": ("doc.txt", "FastAPI 是一个现代 Python Web 框架，用于构建高性能 API。".encode("utf-8"), "text/plain")},
+    )
+
+    # 创建 25 轮对话，确保全部调用 LLM（min_score=-2.0 接受所有向量）
+    # 第 25 轮查询时前 24 轮已完成 = 48 条消息，[-20:] 从第 14 轮开始
+    conv_id: int | None = None
+    for i in range(25):
+        resp = client.post(
+            "/api/query",
+            json={
+                "question": f"第{i}个问题",
+                "top_k": 1,
+                **({"conversation_id": conv_id} if conv_id is not None else {}),
+            },
+        )
+        assert resp.status_code == 200
+        if conv_id is None:
+            conv_id = resp.json()["conversation_id"]
+
+    # 最终 prompt 应只包含最近 20 条消息
+    last_prompt = captured_prompts[-1]
+    # 早于窗口的轮次不应出现（第 0-13 轮）
+    assert "第0个问题" not in last_prompt
+    assert "第10个问题" not in last_prompt
+    assert "第13个问题" not in last_prompt
+    # 窗口内最早和最晚的轮次
+    assert "第14个问题" in last_prompt
+    assert "第23个问题" in last_prompt

@@ -6,6 +6,15 @@ from pydantic import BaseModel, Field, model_validator
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(default=5, ge=1, le=20)
+    conversation_id: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def reject_blank_question(self) -> "QueryRequest":
+        stripped = self.question.strip()
+        if not stripped:
+            raise ValueError("问题不能为空或仅包含空白字符。")
+        self.question = stripped
+        return self
 
 
 class QuerySource(BaseModel):
@@ -23,6 +32,8 @@ class QueryResponse(BaseModel):
     question: str
     answer: str
     sources: list[QuerySource]
+    conversation_id: int | None = None
+    conversation_title: str | None = None
 
 
 class DocumentUploadResponse(BaseModel):
@@ -105,3 +116,50 @@ class ProfileUpdateRequest(BaseModel):
 class PasswordChangeRequest(BaseModel):
     current_password: str = Field(..., min_length=1, max_length=256)
     new_password: str = Field(..., min_length=8, max_length=256)
+
+
+# ── 会话相关 ──
+
+
+class ConversationSummary(BaseModel):
+    """会话列表摘要。"""
+    id: int
+    title: str
+    created_at: datetime
+    last_message_at: datetime
+
+
+class ConversationListResponse(BaseModel):
+    """分页会话列表响应。"""
+    items: list[ConversationSummary]
+    total: int
+
+
+class ConversationMessageOut(BaseModel):
+    """会话消息输出（不含 sources 原始 JSON，前端按需解析）。"""
+    id: int
+    role: str
+    content: str
+    sources: list[QuerySource] | None = None
+    created_at: datetime
+
+
+class ConversationDetail(BaseModel):
+    """会话详情：元信息 + 全部消息。"""
+    id: int
+    title: str
+    created_at: datetime
+    last_message_at: datetime
+    messages: list[ConversationMessageOut]
+
+
+class ConversationRenameRequest(BaseModel):
+    """会话改名请求。"""
+    title: str = Field(..., min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def strip_title(self) -> "ConversationRenameRequest":
+        self.title = self.title.strip()
+        if not self.title:
+            raise ValueError("会话标题不能为空。")
+        return self

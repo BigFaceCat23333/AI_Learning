@@ -6,6 +6,8 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- 按外键依赖顺序清理旧表
+DROP TABLE IF EXISTS conversation_messages;
+DROP TABLE IF EXISTS conversations;
 DROP TABLE IF EXISTS document_chunks;
 DROP TABLE IF EXISTS documents;
 DROP TABLE IF EXISTS captcha_challenges;
@@ -71,6 +73,31 @@ CREATE TABLE captcha_challenges (
 );
 
 CREATE INDEX idx_captcha_challenges_expires_at ON captcha_challenges(expires_at);
+
+-- 会话表
+CREATE TABLE conversations (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_message_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMP NULL
+);
+
+CREATE INDEX idx_conversations_user_list ON conversations(user_id, last_message_at DESC, id DESC);
+
+-- 会话消息表
+CREATE TABLE conversation_messages (
+    id SERIAL PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role VARCHAR(16) NOT NULL,
+    content TEXT NOT NULL,
+    sources JSONB NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_conversation_messages_conv ON conversation_messages(conversation_id);
+ALTER TABLE conversation_messages ADD CONSTRAINT chk_conversation_messages_role CHECK (role IN ('user', 'assistant'));
 
 -- 预置 admin 用户（Argon2id 哈希，密码由部署时安全随机源生成）
 INSERT INTO users (username, password_hash, is_active)

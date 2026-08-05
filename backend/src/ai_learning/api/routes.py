@@ -17,6 +17,11 @@ from ai_learning.agent.graph import run_agent
 from ai_learning.api.schemas import (
     AgentRequest,
     AgentResponse,
+    ConversationDetail,
+    ConversationListResponse,
+    ConversationMessageOut,
+    ConversationRenameRequest,
+    ConversationSummary,
     DocumentListItem,
     DocumentUploadResponse,
     LoginRequest,
@@ -42,7 +47,7 @@ from ai_learning.auth import (
 from ai_learning.core.config import get_settings
 from ai_learning.core.llm_client import LLMClient
 from ai_learning.db import get_db
-from ai_learning.models import Document, DocumentChunk, User
+from ai_learning.models import Conversation, ConversationMessage, Document, DocumentChunk, User
 from ai_learning.rag.embedder import (
     EmbeddingCancelledError,
     EmbeddingServiceError,
@@ -445,6 +450,112 @@ def cancel_document_upload(
     request_upload_cancel(user.id, upload_id)
 
 
+def _resolve_conversation(
+    conversation_id: int | None,
+    db: Session,
+    user: User,
+) -> Conversation | None:
+    """校验会话归属，返回会话对象或 404。
+
+    不存在、已删除或属于其他用户统一返回 404（避免资源存在性泄露）。
+    """
+    if conversation_id is None:
+        return None
+    conv = (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+            Conversation.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if conv is None:
+        raise HTTPException(status_code=404, detail="会话不存在。")
+    return conv
+
+
+def _build_user_history(conv: Conversation | None, current_question: str) -> tuple[str, str]:
+    """根据历史消息构建检索文本和提示词历史段落。
+
+    返回 (search_text, history_text)：
+    - search_text: 最近 3 条用户问题 + 当前问题，用于向量检索改善指代追问。
+    - history_text: 最近 10 轮问答的格式化文本。
+    """
+    if conv is None:
+        return current_question, ""
+
+    messages = conv.messages  # 已按 created_at 正序
+    # 最近 3 条用户问题
+    user_questions = [m.content for m in messages if m.role == "user"][-3:]
+    search_text = "\n".join(user_questions + [current_question])
+
+    # 最近 20 条消息（10 轮问答）
+    recent = messages[-20:]
+    history_parts: list[str] = []
+    for m in recent:
+        role_label = "用户" if m.role == "user" else "助手"
+        history_parts.append(f"{role_label}：{m.content}")
+    history_text = "\n".join(history_parts)
+
+    return search_text, history_text
+
+
+def _persist_conversation_messages(
+    db: Session,
+    user_id: int,
+    conversation_id: int,
+    question: str,
+    answer: str,
+    sources_snapshot: list[dict] | None,
+    is_new: bool,
+) -> tuple[int, str]:
+    """在同一事务中保存用户消息、助手消息并更新会话时间/标题。
+
+    返回 (conversation_id, title)。
+    """
+    now = datetime.utcnow()
+    title = question.strip()[:30]
+
+    if is_new:
+        conv = Conversation(
+            user_id=user_id,
+            title=title,
+            created_at=now,
+            last_message_at=now,
+        )
+        db.add(conv)
+        db.flush()  # 获取 ID
+        conv_id = conv.id
+    else:
+        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        if conv is None:
+            raise HTTPException(status_code=500, detail="会话状态异常。")
+        conv.last_message_at = now
+        conv_id = conv.id
+        title = conv.title
+
+    user_msg = ConversationMessage(
+        conversation_id=conv_id,
+        role="user",
+        content=question,
+        created_at=now,
+    )
+    db.add(user_msg)
+
+    assistant_msg = ConversationMessage(
+        conversation_id=conv_id,
+        role="assistant",
+        content=answer,
+        sources=sources_snapshot,
+        created_at=now,
+    )
+    db.add(assistant_msg)
+
+    db.commit()
+    return conv_id, title
+
+
 @router.post("/query", response_model=QueryResponse)
 def query(
     request: QueryRequest,
@@ -452,13 +563,15 @@ def query(
     user: User = Depends(get_current_user),
 ) -> QueryResponse:
     settings = get_settings()
+    log_prefix = (
+        f"查询请求 | user_id={user.id} conv_id={request.conversation_id} "
+        f"question_length={len(request.question)} top_k={request.top_k}"
+    )
     if settings.rag_debug_logs:
-        logger.info(
-            "查询请求 | user_id=%d question_length=%d top_k=%d",
-            user.id,
-            len(request.question),
-            request.top_k,
-        )
+        logger.info(log_prefix)
+
+    # 校验会话归属
+    conv = _resolve_conversation(request.conversation_id, db, user)
 
     # 检查当前用户是否有文档
     chunk_count = (
@@ -472,7 +585,10 @@ def query(
             logger.info("查询拒绝 | user_id=%d 原因=无文档", user.id)
         raise HTTPException(status_code=404, detail="No documents have been uploaded.")
 
-    # 使用向量检索召回
+    # 构建检索文本（含历史用户问题改善指代追问）和提示词历史
+    search_text, history_text = _build_user_history(conv, request.question)
+
+    # 向量检索召回
     try:
         embedder = get_embedding_client(settings)
     except ValueError as exc:
@@ -480,7 +596,7 @@ def query(
 
     try:
         results = retrieve(
-            query=request.question,
+            query=search_text,
             db=db,
             embedder=embedder,
             top_k=request.top_k,
@@ -494,62 +610,248 @@ def query(
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Embedding provider error: {exc}") from exc
 
-    # 低相关度拒答
-    if not results:
-        if settings.rag_debug_logs:
-            logger.info("查询拒答 | user_id=%d 原因=低相关度 阈值=%.2f", user.id, settings.retrieval_min_score)
-        return QueryResponse(
-            question=request.question,
-            answer="文档中没有找到足够依据。",
-            sources=[],
-        )
-
-    # 构建带引用编号的 Context
+    # 构建 Source 列表和快照
     context_parts: list[str] = []
     sources: list[QuerySource] = []
+    sources_snapshot: list[dict] = []
     for idx, result in enumerate(results, start=1):
         chunk = result.chunk
         context_parts.append(f"[{idx}] {chunk.chunk_text}")
-        sources.append(
-            QuerySource(
-                document_id=chunk.document_id,
-                filename=chunk.document.filename,
-                file_type=chunk.document.file_type,
-                chunk_id=chunk.id,
-                chunk_index=chunk.chunk_metadata.get("chunk_index", chunk.chunk_index),
-                chunk_text=chunk.chunk_text,
-                score=round(result.score, 4),
-                chunk_metadata=chunk.chunk_metadata,
+        source = QuerySource(
+            document_id=chunk.document_id,
+            filename=chunk.document.filename,
+            file_type=chunk.document.file_type,
+            chunk_id=chunk.id,
+            chunk_index=chunk.chunk_metadata.get("chunk_index", chunk.chunk_index),
+            chunk_text=chunk.chunk_text,
+            score=round(result.score, 4),
+            chunk_metadata=chunk.chunk_metadata,
+        )
+        sources.append(source)
+        sources_snapshot.append(source.model_dump())
+
+    # 低相关度拒答（仍需持久化）
+    if not results:
+        if settings.rag_debug_logs:
+            logger.info(
+                "查询拒答 | user_id=%d 原因=低相关度 阈值=%.2f",
+                user.id,
+                settings.retrieval_min_score,
             )
+        answer = "文档中没有找到足够依据。"
+        conv_id, conv_title = _persist_conversation_messages(
+            db,
+            user.id,
+            request.conversation_id,
+            request.question,
+            answer,
+            None,
+            is_new=(conv is None),
+        )
+        return QueryResponse(
+            question=request.question,
+            answer=answer,
+            sources=[],
+            conversation_id=conv_id,
+            conversation_title=conv_title,
         )
 
+    # 构建提示词
     context = "\n\n".join(context_parts)
-    prompt = (
+    prompt_parts: list[str] = []
+    prompt_parts.append(
         "请仅根据以下检索到的上下文回答用户问题。如果上下文中没有足够依据，请明确说"
-        "\"根据已有文档，无法回答该问题\"，不要编造任何信息。\n\n"
-        f"用户问题：\n{request.question}\n\n"
-        f"检索上下文（带引用编号）：\n{context}"
+        "\"根据已有文档，无法回答该问题\"，不要编造任何信息。\n"
     )
+    if history_text:
+        prompt_parts.append(f"## 历史对话\n{history_text}\n")
+    prompt_parts.append(f"## 检索上下文（带引用编号）\n{context}")
+    prompt_parts.append(f"## 用户问题\n{request.question}")
+    prompt = "\n\n".join(prompt_parts)
 
+    # LLM 调用
     try:
         answer = LLMClient().complete(prompt)
     except ValueError as exc:
+        # LLM 配置缺失：不保存消息
         if settings.rag_debug_logs:
             logger.warning("查询失败 | user_id=%d 原因=LLM配置缺失", user.id)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
+        # LLM 上游网络错误：不保存消息
         if settings.rag_debug_logs:
             logger.warning("查询失败 | user_id=%d 原因=LLM上游错误", user.id)
         raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}") from exc
 
+    # 持久化消息（成功回答或拒答都在此处）
+    conv_id, conv_title = _persist_conversation_messages(
+        db,
+        user.id,
+        request.conversation_id,
+        request.question,
+        answer,
+        sources_snapshot,
+        is_new=(conv is None),
+    )
+
     if settings.rag_debug_logs:
         logger.info(
-            "查询完成 | user_id=%d answer_length=%d source_count=%d",
+            "查询完成 | user_id=%d conv_id=%d answer_length=%d source_count=%d",
             user.id,
+            conv_id,
             len(answer),
             len(sources),
         )
-    return QueryResponse(question=request.question, answer=answer, sources=sources)
+    return QueryResponse(
+        question=request.question,
+        answer=answer,
+        sources=sources,
+        conversation_id=conv_id,
+        conversation_title=conv_title,
+    )
+
+
+# ── 会话接口 ──
+
+
+@router.get("/conversations", response_model=ConversationListResponse)
+def list_conversations(
+    offset: int = 0,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ConversationListResponse:
+    """返回当前用户未删除会话的分页列表，按 last_message_at 倒序。"""
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset 不能为负数。")
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit 必须在 1～100 之间。")
+
+    base = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == user.id, Conversation.deleted_at.is_(None))
+    )
+    total = base.count()
+    items = (
+        base
+        .order_by(Conversation.last_message_at.desc(), Conversation.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return ConversationListResponse(
+        items=[
+            ConversationSummary(
+                id=c.id,
+                title=c.title,
+                created_at=c.created_at,
+                last_message_at=c.last_message_at,
+            )
+            for c in items
+        ],
+        total=total,
+    )
+
+
+@router.get("/conversations/{conversation_id}", response_model=ConversationDetail)
+def get_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ConversationDetail:
+    """返回会话详情及全部消息（按创建时间正序）。"""
+    conv = (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+            Conversation.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if conv is None:
+        raise HTTPException(status_code=404, detail="会话不存在。")
+
+    messages = [
+        ConversationMessageOut(
+            id=m.id,
+            role=m.role,
+            content=m.content,
+            sources=(
+                [QuerySource(**s) for s in m.sources]
+                if m.sources is not None
+                else None
+            ),
+            created_at=m.created_at,
+        )
+        for m in conv.messages
+    ]
+
+    return ConversationDetail(
+        id=conv.id,
+        title=conv.title,
+        created_at=conv.created_at,
+        last_message_at=conv.last_message_at,
+        messages=messages,
+    )
+
+
+@router.patch("/conversations/{conversation_id}", response_model=ConversationSummary)
+def rename_conversation(
+    conversation_id: int,
+    body: ConversationRenameRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ConversationSummary:
+    """重命名当前用户的会话。"""
+    conv = (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+            Conversation.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if conv is None:
+        raise HTTPException(status_code=404, detail="会话不存在。")
+
+    conv.title = body.title
+    db.commit()
+    db.refresh(conv)
+
+    return ConversationSummary(
+        id=conv.id,
+        title=conv.title,
+        created_at=conv.created_at,
+        last_message_at=conv.last_message_at,
+    )
+
+
+@router.delete("/conversations/{conversation_id}", status_code=204)
+def delete_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    """软删除当前用户的会话。"""
+    conv = (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+            Conversation.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if conv is None:
+        raise HTTPException(status_code=404, detail="会话不存在。")
+
+    conv.deleted_at = datetime.utcnow()
+    db.commit()
+
+
+# ── Agent 接口 ──
 
 
 @router.post("/agent", response_model=AgentResponse)
