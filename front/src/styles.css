@@ -102,6 +102,18 @@ body {
   width: 340px;
   flex-shrink: 0;
   border-left: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.document-sidebar-toolbar {
+  display: none;
+}
+
+.document-sidebar-content {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -1573,6 +1585,52 @@ body {
 }
 
 @media (min-width: 769px) {
+  .app-sidebar {
+    transition: width 0.2s ease;
+  }
+
+  .app-sidebar.collapsed {
+    width: 48px;
+  }
+
+  .document-sidebar-toolbar {
+    display: flex;
+    justify-content: flex-start;
+    flex-shrink: 0;
+    padding: 12px 8px;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .app-sidebar.collapsed .document-sidebar-toolbar {
+    justify-content: center;
+  }
+
+  .document-sidebar-toggle {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    background: var(--color-surface);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
+  }
+
+  .document-sidebar-toggle:hover {
+    color: var(--color-primary);
+    border-color: var(--color-primary);
+    background: var(--color-accent);
+  }
+
+  .app-sidebar.collapsed .document-sidebar-content {
+    display: none;
+  }
+
   .conv-sidebar {
     transition: width 0.2s ease;
   }
@@ -1609,6 +1667,10 @@ body {
     border-top: 1px solid var(--color-border);
     border-bottom: none;
     max-height: 45vh;
+    overflow: hidden;
+  }
+
+  .document-sidebar-content {
     overflow-y: auto;
   }
 

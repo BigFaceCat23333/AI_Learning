@@ -30,6 +30,7 @@ export default function App() {
   const [listError, setListError] = useState<string | null>(null);
   const [hasUploadedDocs, setHasUploadedDocs] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
+  const [documentSidebarCollapsed, setDocumentSidebarCollapsed] = useState(false);
 
   // 单调递增的 session generation，每轮登录递增，替代布尔值避免跨用户竞态
   const sessionGenRef = useRef(0);
@@ -244,15 +245,31 @@ export default function App() {
         <section className="app-content">
           <ChatPanel hasDocuments={hasUploadedDocs} />
         </section>
-        <aside className="app-sidebar">
-          <UploadPanel
-            onUploadSuccess={handleUploadSuccess}
-            documents={documents}
-            listLoading={listLoading}
-            listError={listError}
-            onRetry={loadDocuments}
-            onDeleteSuccess={handleDocumentDeleted}
-          />
+        <aside
+          className={`app-sidebar ${documentSidebarCollapsed ? "collapsed" : ""}`}
+        >
+          <div className="document-sidebar-toolbar">
+            <button
+              type="button"
+              className="document-sidebar-toggle"
+              onClick={() => setDocumentSidebarCollapsed((collapsed) => !collapsed)}
+              aria-label={documentSidebarCollapsed ? "展开文档上传栏" : "收起文档上传栏"}
+              aria-expanded={!documentSidebarCollapsed}
+              title={documentSidebarCollapsed ? "展开文档上传栏" : "收起文档上传栏"}
+            >
+              {documentSidebarCollapsed ? "«" : "»"}
+            </button>
+          </div>
+          <div className="document-sidebar-content">
+            <UploadPanel
+              onUploadSuccess={handleUploadSuccess}
+              documents={documents}
+              listLoading={listLoading}
+              listError={listError}
+              onRetry={loadDocuments}
+              onDeleteSuccess={handleDocumentDeleted}
+            />
+          </div>
         </aside>
       </main>
     </div>
